@@ -1,196 +1,76 @@
-#!/usr/bin/env python3
-# main.py - Multi-instrument Nifty/Stocks LTP Bot (Dhan API v2)
-# Updated: fixes coroutine-not-awaited for debug send; sends debug preview via requests.post (sync).
-
-import os
-import time
-import json
-import logging
-import requests
 import asyncio
-from datetime import datetime
+import os
 from telegram import Bot
+import requests
+from datetime import datetime
+import logging
+import pandas as pd
+from io import StringIO
 
-# -------------------------
-# Configuration / Env
-# -------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
-DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
-
-# Dhan endpoints
-DHAN_API_BASE = "https://api.dhan.co"
-DHAN_LTP_URL = f"{DHAN_API_BASE}/v2/marketfeed/ltp"
-DHAN_OHLC_URL = f"{DHAN_API_BASE}/v2/marketfeed/ohlc"
-
-# Instruments
-INSTRUMENTS = {
-    "RELIANCE": "RELIANCE",
-    "HDFC Bank": "HDFCBANK",
-    "ICICI Bank": "ICICIBANK",
-    "Bajaj Finance": "BAJFINANCE",
-    "Infosys": "INFY",
-    "Tata Motors": "TATAMOTORS",
-    "Axis Bank": "AXISBANK",
-    "State Bank of India": "SBIN",
-    "LTIMindtree": "LTIM",
-    "Adani Enterprises": "ADANIENT",
-    "Kotak Mahindra Bank": "KOTAKBANK",
-    "Larsen & Toubro": "LT",
-    "Maruti Suzuki": "MARUTI",
-    "Tech Mahindra": "TECHM",
-    "LIC of India": "LICI",
-    "Hindustan Unilever": "HINDUNILVR",
-    "NTPC Ltd": "NTPC",
-    "Bharti Airtel": "BHARTIARTL",
-    "Power Grid": "POWERGRID",
-    "ONGC": "ONGC",
-    "Persistent Systems": "PERSISTENT",
-    "DR Reddy's": "DRREDDY",
-    "M&M": "M&M",
-    "Wipro": "WIPRO",
-    "Dmart": "AVENUE_SUPERMARTS",
-    "Trent Ltd": "TRENT",
-    "Poonawalla": "POONAWALLA",
-}
-
-INDEX_SYMBOLS = {"NIFTY 50": "NIFTY 50", "SENSEX": "SENSEX"}
-EXTRA_INDEX_IDS = {"NIFTY 50": 13}
-
-# -------------------------
-# Logging
-# -------------------------
+# Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# -------------------------
-# Utilities
-# -------------------------
-def escape_markdown_v2(text: str) -> str:
-    if not isinstance(text, str):
-        text = str(text)
-    to_escape = r'_*[]()~`>#+-=|{}.!'
-    return ''.join('\\' + ch if ch in to_escape else ch for ch in text)
+# ========================
+# CONFIGURATION
+# ========================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
+DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 
-def chunk_message(text: str, limit: int = 4000):
-    if len(text) <= limit:
-        return [text]
-    lines = text.splitlines(keepends=True)
-    chunks = []
-    current = ""
-    for ln in lines:
-        if len(current) + len(ln) <= limit:
-            current += ln
-        else:
-            if current:
-                chunks.append(current)
-            if len(ln) > limit:
-                for i in range(0, len(ln), limit):
-                    chunks.append(ln[i:i+limit])
-                current = ""
-            else:
-                current = ln
-    if current:
-        chunks.append(current)
-    return chunks
+# Dhan API URLs
+DHAN_API_BASE = "https://api.dhan.co"
+DHAN_OHLC_URL = f"{DHAN_API_BASE}/v2/marketfeed/ohlc"
+DHAN_OPTION_CHAIN_URL = f"{DHAN_API_BASE}/v2/optionchain"
+DHAN_EXPIRY_LIST_URL = f"{DHAN_API_BASE}/v2/optionchain/expirylist"
+DHAN_INSTRUMENTS_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
-def save_debug_file(resp_text: str):
-    try:
-        ts = int(time.time())
-        path = f"/tmp/dhan_ltp_debug_{ts}.json"
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(resp_text)
-        return path
-    except Exception as e:
-        logger.error("Failed to write debug file: %s", e)
-        return None
+# Stock/Index List - Symbol mapping
+STOCKS_INDICES = {
+    # Indices
+    "NIFTY 50": {"symbol": "NIFTY 50", "segment": "IDX_I"},
+    "NIFTY BANK": {"symbol": "NIFTY BANK", "segment": "IDX_I"},
+    "SENSEX": {"symbol": "SENSEX", "segment": "IDX_I"},
+    
+    # Stocks
+    "RELIANCE": {"symbol": "RELIANCE", "segment": "NSE_EQ"},
+    "HDFCBANK": {"symbol": "HDFCBANK", "segment": "NSE_EQ"},
+    "ICICIBANK": {"symbol": "ICICIBANK", "segment": "NSE_EQ"},
+    "BAJFINANCE": {"symbol": "BAJFINANCE", "segment": "NSE_EQ"},
+    "INFY": {"symbol": "INFY", "segment": "NSE_EQ"},
+    "TATAMOTORS": {"symbol": "TATAMOTORS", "segment": "NSE_EQ"},
+    "AXISBANK": {"symbol": "AXISBANK", "segment": "NSE_EQ"},
+    "SBIN": {"symbol": "SBIN", "segment": "NSE_EQ"},
+    "LTIM": {"symbol": "LTIM", "segment": "NSE_EQ"},
+    "ADANIENT": {"symbol": "ADANIENT", "segment": "NSE_EQ"},
+    "KOTAKBANK": {"symbol": "KOTAKBANK", "segment": "NSE_EQ"},
+    "LT": {"symbol": "LT", "segment": "NSE_EQ"},
+    "MARUTI": {"symbol": "MARUTI", "segment": "NSE_EQ"},
+    "TECHM": {"symbol": "TECHM", "segment": "NSE_EQ"},
+    "LICI": {"symbol": "LICI", "segment": "NSE_EQ"},
+    "HINDUNILVR": {"symbol": "HINDUNILVR", "segment": "NSE_EQ"},
+    "NTPC": {"symbol": "NTPC", "segment": "NSE_EQ"},
+    "BHARTIARTL": {"symbol": "BHARTIARTL", "segment": "NSE_EQ"},
+    "POWERGRID": {"symbol": "POWERGRID", "segment": "NSE_EQ"},
+    "ONGC": {"symbol": "ONGC", "segment": "NSE_EQ"},
+    "PERSISTENT": {"symbol": "PERSISTENT", "segment": "NSE_EQ"},
+    "DRREDDY": {"symbol": "DRREDDY", "segment": "NSE_EQ"},
+    "M&M": {"symbol": "M&M", "segment": "NSE_EQ"},
+    "WIPRO": {"symbol": "WIPRO", "segment": "NSE_EQ"},
+    "DMART": {"symbol": "DMART", "segment": "NSE_EQ"},
+    "TRENT": {"symbol": "TRENT", "segment": "NSE_EQ"},
+}
 
-def safe_truncate(s: str, n: int = 1200):
-    if not s:
-        return ""
-    return s[:n] + ("" if len(s) <= n else "\n\n...TRUNCATED...")
+# ========================
+# BOT CODE
+# ========================
 
-def recursively_collect_pairs(obj, path=()):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            yield from recursively_collect_pairs(v, path + (str(k),))
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            yield from recursively_collect_pairs(v, path + (f"[{i}]",))
-    else:
-        yield (path, None, obj)
-
-def find_numeric_candidates_for_symbol(raw_json, symbol_variants):
-    candidates = {}
-    def scan(node):
-        if isinstance(node, dict):
-            for k, v in node.items():
-                k_norm = str(k).upper()
-                for sym in symbol_variants:
-                    su = sym.upper()
-                    if su == k_norm or su in k_norm or k_norm in su:
-                        if isinstance(v, (int, float)):
-                            candidates.setdefault(sym, float(v))
-                        elif isinstance(v, str):
-                            try:
-                                candidates.setdefault(sym, float(v.replace(",", "")))
-                            except:
-                                pass
-                        elif isinstance(v, (dict, list)):
-                            for _, _, leaf in recursively_collect_pairs(v):
-                                if isinstance(leaf, (int, float)):
-                                    candidates.setdefault(sym, float(leaf))
-                                elif isinstance(leaf, str):
-                                    try:
-                                        candidates.setdefault(sym, float(leaf.replace(",", "")))
-                                    except:
-                                        pass
-                scan(v)
-        elif isinstance(node, list):
-            for it in node:
-                scan(it)
-    try:
-        scan(raw_json)
-    except Exception as e:
-        logger.debug("Error during heuristic scan: %s", e)
-    return candidates
-
-# -------------------------
-# Synchronous Telegram debug send helper (fix coroutine issue)
-# -------------------------
-def telegram_send_debug_preview_sync(preview_text: str):
-    """
-    Send a plain-text debug preview to Telegram using synchronous requests.post
-    to avoid coroutine/async mismatch when called from sync code.
-    """
-    try:
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            logger.debug("Telegram token/ chat id missing; skipping debug preview send")
-            return False
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": f"DEBUG LTP preview (truncated):\n\n{preview_text}"
-        }
-        r = requests.post(url, json=payload, timeout=10)
-        logger.info("Telegram debug preview send status: %s", r.status_code)
-        return r.status_code == 200
-    except Exception as e:
-        logger.debug("Failed sending debug preview via requests: %s", e)
-        return False
-
-# -------------------------
-# Bot class
-# -------------------------
-class MultiLTPBot:
+class DhanOptionChainBot:
     def __init__(self):
-        if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN]):
-            logger.error("Missing environment variables. Set: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN")
-            raise SystemExit(1)
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.running = True
         self.headers = {
@@ -199,132 +79,305 @@ class MultiLTPBot:
             'Content-Type': 'application/json',
             'Accept': 'application/json'
         }
-        logger.info("Bot initialized successfully with %d instruments", len(INSTRUMENTS))
-
-    def _build_payload_for_symbols(self):
-        symbols = []
-        for disp, sym in INSTRUMENTS.items():
-            symbols.append(sym)
-        for name, sym in INDEX_SYMBOLS.items():
-            symbols.append(sym)
-        return {"S": symbols}
-
-    def fetch_symbol_ltps(self):
-        payload = self._build_payload_for_symbols()
+        self.security_id_map = {}
+        logger.info("Bot initialized successfully")
+    
+    async def load_security_ids(self):
+        """Dhan मधून security IDs load करतो"""
         try:
-            resp = requests.post(DHAN_LTP_URL, json=payload, headers=self.headers, timeout=10)
-            logger.info("LTP API status: %s", resp.status_code)
-            txt = resp.text
-            logger.debug("LTP raw (truncated): %s", txt[:1500])
-
-            # Save debug file & send preview to Telegram synchronously (fixes coroutine error)
-            try:
-                dbg_path = save_debug_file(txt)
-                if dbg_path:
-                    logger.info("Saved raw LTP response to %s", dbg_path)
-                preview = safe_truncate(txt, 1200)
-                telegram_send_debug_preview_sync(preview)  # <<< synchronous send (fixed)
-            except Exception as e:
-                logger.debug("Debug save/preview skipped: %s", e)
-
-            if resp.status_code == 429:
-                ra = resp.headers.get("Retry-After")
-                logger.warning("Dhan LTP rate-limited 429. Retry-After: %s", ra)
-                return {"__429__": ra}
-            if resp.status_code != 200:
-                logger.warning("Non-200 from LTP: %s", resp.status_code)
-                return {}
-
-            j = resp.json()
-            result = {}
-
-            data = j.get("data") or j
-            s_block = data.get("S") if isinstance(data, dict) else None
-            if s_block and isinstance(s_block, dict):
-                for sym, info in s_block.items():
-                    result[sym] = info
-                return result
-
-            requested = set(self._build_payload_for_symbols().get("S", []))
-            if isinstance(data, dict):
-                for k, v in data.items():
-                    if k in requested:
-                        result[k] = v
-            if result:
-                return result
-
-            logger.info("Falling back to heuristic raw parsing of LTP response JSON")
-            raw_json = j
-            heuristic_map = {}
-            for display_name, sym in INSTRUMENTS.items():
-                variants = set()
-                variants.add(sym)
-                variants.add(display_name)
-                variants.add(sym.replace(" ", "").upper())
-                variants.add(display_name.replace(" ", "").upper())
-                variants.add(sym + ".NS")
-                variants.add(sym + "NSE")
-                candidates = find_numeric_candidates_for_symbol(raw_json, variants)
-                if candidates:
-                    try:
-                        chosen = max(candidates.values())
-                    except Exception:
-                        chosen = list(candidates.values())[0]
-                    heuristic_map[sym] = {"last_price": chosen}
-            if heuristic_map:
-                logger.info("Heuristic found %d instruments", len(heuristic_map))
-                return heuristic_map
-
-            logger.warning("No data parsed from LTP response; returning raw JSON for inspection")
-            return {"__raw__": j}
-
-        except requests.exceptions.Timeout:
-            logger.error("LTP request timeout")
-            return {}
-        except requests.exceptions.RequestException as e:
-            logger.error("LTP request error: %s", e)
-            return {}
+            logger.info("Loading security IDs from Dhan...")
+            response = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
+            
+            if response.status_code == 200:
+                # CSV parse करतो
+                df = pd.read_csv(StringIO(response.text))
+                
+                for symbol, info in STOCKS_INDICES.items():
+                    segment = info['segment']
+                    symbol_name = info['symbol']
+                    
+                    # Security ID शोधतो
+                    if segment == "IDX_I":
+                        # Index साठी
+                        mask = (df['SEM_SEGMENT'] == 'I') & (df['SEM_TRADING_SYMBOL'] == symbol_name)
+                    else:
+                        # Stock साठी
+                        mask = (df['SEM_SEGMENT'] == 'E') & (df['SEM_TRADING_SYMBOL'] == symbol_name) & (df['SEM_EXM_EXCH_ID'] == 'NSE')
+                    
+                    filtered = df[mask]
+                    
+                    if not filtered.empty:
+                        sec_id = filtered.iloc[0]['SEM_SMST_SECURITY_ID']
+                        self.security_id_map[symbol] = {
+                            'security_id': int(sec_id),
+                            'segment': segment,
+                            'trading_symbol': symbol_name
+                        }
+                        logger.info(f"✅ {symbol}: Security ID = {sec_id}")
+                    else:
+                        logger.warning(f"❌ {symbol}: Security ID नाही मिळाला!")
+                
+                logger.info(f"Total {len(self.security_id_map)} securities loaded")
+                return True
+            else:
+                logger.error(f"Failed to load instruments: {response.status_code}")
+                return False
+                
         except Exception as e:
-            logger.error("Unexpected error in fetch_symbol_ltps: %s", e)
-            return {}
-
-    def fetch_index_ohlc(self, index_id):
-        payload = {"IDX_I": [index_id]}
+            logger.error(f"Error loading security IDs: {e}")
+            return False
+    
+    def get_nearest_expiry(self, security_id, segment):
+        """सर्वात जवळचा expiry काढतो"""
         try:
-            resp = requests.post(DHAN_OHLC_URL, json=payload, headers=self.headers, timeout=10)
-            logger.info("Index OHLC status: %s (id=%s)", resp.status_code, index_id)
-            logger.debug("Index OHLC raw (truncated): %s", resp.text[:1500])
-
-            if resp.status_code == 429:
-                ra = resp.headers.get("Retry-After")
-                logger.warning("Index OHLC rate-limited 429. Retry-After: %s", ra)
-                return {"__429__": ra}
-            if resp.status_code != 200:
+            payload = {
+                "UnderlyingScrip": security_id,
+                "UnderlyingSeg": segment
+            }
+            
+            response = requests.post(
+                DHAN_EXPIRY_LIST_URL,
+                json=payload,
+                headers=self.headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success' and data.get('data'):
+                    expiries = data['data']
+                    if expiries:
+                        return expiries[0]  # पहिला expiry = nearest
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting expiry: {e}")
+            return None
+    
+    def get_option_chain(self, security_id, segment, expiry):
+        """Option chain data घेतो"""
+        try:
+            payload = {
+                "UnderlyingScrip": security_id,
+                "UnderlyingSeg": segment,
+                "Expiry": expiry
+            }
+            
+            response = requests.post(
+                DHAN_OPTION_CHAIN_URL,
+                json=payload,
+                headers=self.headers,
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('data'):
+                    return data['data']
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting option chain: {e}")
+            return None
+    
+    def format_option_chain_message(self, symbol, data, expiry):
+        """Option chain साठी सुंदर message format"""
+        try:
+            spot_price = data.get('last_price', 0)
+            oc_data = data.get('oc', {})
+            
+            if not oc_data:
                 return None
-            j = resp.json()
-            if j.get("status") == "success" and "data" in j:
-                idx_block = j["data"].get("IDX_I", {})
-                item = idx_block.get(str(index_id)) or idx_block.get(index_id)
-                return item
-            return None
+            
+            # ATM strike शोधतो
+            strikes = sorted([float(s) for s in oc_data.keys()])
+            atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
+            
+            # ATM च्या आजूबाजूचे 5 strikes घेतो (एकूण 11)
+            atm_idx = strikes.index(atm_strike)
+            start_idx = max(0, atm_idx - 5)
+            end_idx = min(len(strikes), atm_idx + 6)
+            selected_strikes = strikes[start_idx:end_idx]
+            
+            # Message तयार करतो
+            msg = f"📊 *{symbol} OPTION CHAIN*\n"
+            msg += f"📅 Expiry: {expiry}\n"
+            msg += f"💰 Spot: ₹{spot_price:,.2f}\n"
+            msg += f"🎯 ATM: ₹{atm_strike:,.0f}\n\n"
+            
+            msg += "```\n"
+            msg += "Strike   CE-LTP  CE-OI  CE-Vol  PE-LTP  PE-OI  PE-Vol\n"
+            msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            
+            for strike in selected_strikes:
+                strike_key = f"{strike:.6f}"
+                strike_data = oc_data.get(strike_key, {})
+                
+                ce = strike_data.get('ce', {})
+                pe = strike_data.get('pe', {})
+                
+                ce_ltp = ce.get('last_price', 0)
+                ce_oi = ce.get('oi', 0)
+                ce_vol = ce.get('volume', 0)
+                
+                pe_ltp = pe.get('last_price', 0)
+                pe_oi = pe.get('oi', 0)
+                pe_vol = pe.get('volume', 0)
+                
+                # ATM mark करतो
+                atm_mark = "🔸" if strike == atm_strike else "  "
+                
+                msg += f"{atm_mark}{strike:6.0f}  {ce_ltp:6.1f} {ce_oi/1000:6.0f}K {ce_vol/1000:6.0f}K  {pe_ltp:6.1f} {pe_oi/1000:6.0f}K {pe_vol/1000:6.0f}K\n"
+            
+            msg += "```\n\n"
+            
+            # Greeks आणि IV (ATM साठी)
+            atm_data = oc_data.get(f"{atm_strike:.6f}", {})
+            if atm_data:
+                ce_greeks = atm_data.get('ce', {}).get('greeks', {})
+                pe_greeks = atm_data.get('pe', {}).get('greeks', {})
+                ce_iv = atm_data.get('ce', {}).get('implied_volatility', 0)
+                pe_iv = atm_data.get('pe', {}).get('implied_volatility', 0)
+                
+                msg += "📈 *ATM Greeks & IV:*\n"
+                msg += f"CE: Δ={ce_greeks.get('delta', 0):.3f} Θ={ce_greeks.get('theta', 0):.2f} IV={ce_iv:.1f}%\n"
+                msg += f"PE: Δ={pe_greeks.get('delta', 0):.3f} Θ={pe_greeks.get('theta', 0):.2f} IV={pe_iv:.1f}%\n"
+            
+            return msg
+            
         except Exception as e:
-            logger.error("Error fetching index OHLC: %s", e)
+            logger.error(f"Error formatting message for {symbol}: {e}")
             return None
+    
+    async def send_option_chain_batch(self, symbols_batch):
+        """एका batch चे option chain data पाठवतो"""
+        for symbol in symbols_batch:
+            try:
+                if symbol not in self.security_id_map:
+                    logger.warning(f"Skipping {symbol} - No security ID")
+                    continue
+                
+                info = self.security_id_map[symbol]
+                security_id = info['security_id']
+                segment = info['segment']
+                
+                # Nearest expiry शोधतो
+                expiry = self.get_nearest_expiry(security_id, segment)
+                if not expiry:
+                    logger.warning(f"{symbol}: Expiry नाही मिळाला")
+                    continue
+                
+                logger.info(f"Fetching option chain for {symbol} (Expiry: {expiry})...")
+                
+                # Option chain data घेतो
+                oc_data = self.get_option_chain(security_id, segment, expiry)
+                if not oc_data:
+                    logger.warning(f"{symbol}: Option chain data नाही मिळाला")
+                    continue
+                
+                # Message format करतो
+                message = self.format_option_chain_message(symbol, oc_data, expiry)
+                if message:
+                    await self.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=message,
+                        parse_mode='Markdown'
+                    )
+                    logger.info(f"✅ {symbol} option chain sent")
+                
+                # Rate limit साठी थांबतो (3 seconds per request as per Dhan)
+                await asyncio.sleep(3)
+                
+            except Exception as e:
+                logger.error(f"Error processing {symbol}: {e}")
+                await asyncio.sleep(3)
+    
+    async def run(self):
+        """Main loop - every 5 minutes option chain पाठवतो"""
+        logger.info("🚀 Bot started! Loading security IDs...")
+        
+        # Security IDs load करतो
+        success = await self.load_security_ids()
+        if not success:
+            logger.error("Failed to load security IDs. Exiting...")
+            return
+        
+        await self.send_startup_message()
+        
+        # Symbols ला batches मध्ये divide करतो (5 per batch)
+        all_symbols = list(self.security_id_map.keys())
+        batch_size = 5
+        batches = [all_symbols[i:i+batch_size] for i in range(0, len(all_symbols), batch_size)]
+        
+        logger.info(f"Total {len(all_symbols)} symbols in {len(batches)} batches")
+        
+        while self.running:
+            try:
+                timestamp = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+                logger.info(f"\n{'='*50}")
+                logger.info(f"Starting option chain update cycle at {timestamp}")
+                logger.info(f"{'='*50}")
+                
+                # प्रत्येक batch process करतो
+                for batch_num, batch in enumerate(batches, 1):
+                    logger.info(f"\n📦 Processing Batch {batch_num}/{len(batches)}: {batch}")
+                    await self.send_option_chain_batch(batch)
+                    
+                    # Batches मध्ये 5 second gap
+                    if batch_num < len(batches):
+                        logger.info(f"Waiting 5 seconds before next batch...")
+                        await asyncio.sleep(5)
+                
+                logger.info("\n✅ All batches completed!")
+                logger.info("⏳ Waiting 5 minutes for next cycle...\n")
+                
+                # 5 minutes wait
+                await asyncio.sleep(300)
+                
+            except KeyboardInterrupt:
+                logger.info("Bot stopped by user")
+                self.running = False
+                break
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}")
+                await asyncio.sleep(60)
+    
+    async def send_startup_message(self):
+        """Bot सुरू झाल्यावर message पाठवतो"""
+        try:
+            msg = "🤖 *Dhan Option Chain Bot Started!*\n\n"
+            msg += f"📊 Tracking {len(self.security_id_map)} stocks/indices\n"
+            msg += "⏱️ Updates every 5 minutes\n"
+            msg += "📈 Option Chain: CE/PE LTP, OI, Volume, Greeks, IV\n\n"
+            msg += "✅ Powered by DhanHQ API v2\n"
+            msg += "🚂 Deployed on Railway.app\n\n"
+            msg += "_Market Hours: 9:15 AM - 3:30 PM (Mon-Fri)_"
+            
+            await self.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=msg,
+                parse_mode='Markdown'
+            )
+            logger.info("Startup message sent")
+        except Exception as e:
+            logger.error(f"Error sending startup message: {e}")
 
-    # build_report_from_data, send_text_safe, send_startup_message, run remain same as earlier
-    # For brevity, reusing previously provided implementations (not repeated here due to length).
-    # Make sure to include them in your file — exactly as in previous version.
 
-    # --- For full code, copy the build_report_from_data, send_text_safe, send_startup_message, run from previous main.py ---
-    # (They are unchanged except fetch_symbol_ltps debug send fix above.)
-
-# -------------------------
-# Run
-# -------------------------
+# ========================
+# BOT RUN करा
+# ========================
 if __name__ == "__main__":
     try:
-        bot = MultiLTPBot()
+        # Environment variables check
+        if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN]):
+            logger.error("❌ Missing environment variables!")
+            logger.error("Please set: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN")
+            exit(1)
+        
+        bot = DhanOptionChainBot()
         asyncio.run(bot.run())
     except Exception as e:
-        logger.error("Fatal error: %s", e)
-        raise SystemExit(1)
+        logger.error(f"Fatal error: {e}")
+        exit(1)
