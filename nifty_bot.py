@@ -42,11 +42,18 @@ class NiftyWebSocketBot:
         self.dhan_context = DhanContext(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
         self.dhan = dhanhq(self.dhan_context)
         
-        # Market Feed Setup
+        # Market Feed Setup - v2 format
         instruments = [
-            (MarketFeed.IDX, NIFTY_50_SECURITY_ID, MarketFeed.Full)  # Full packet for Nifty
+            (MarketFeed.IDX, NIFTY_50_SECURITY_ID, MarketFeed.Full)
         ]
-        self.market_feed = MarketFeed(self.dhan_context, instruments, "v2")
+        
+        # Try v2 first, fallback to v1 if needed
+        try:
+            self.market_feed = MarketFeed(self.dhan_context, instruments, "v2")
+            logger.info("✅ Using Dhan WebSocket v2")
+        except:
+            self.market_feed = MarketFeed(self.dhan_context, instruments)
+            logger.info("✅ Using Dhan WebSocket v1")
         
         self.current_expiry = None
         self.last_ltp_data = None
