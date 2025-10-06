@@ -1,29 +1,37 @@
 #!/usr/bin/env python3
-# multi_ltp_heuristic.py - improved heuristic parsing for Dhan LTP raw responses
-import asyncio
+# main.py - Multi-instrument Nifty/Stocks LTP Bot (Dhan API v2)
+# Features:
+# - fetches many instruments + NIFTY/SENSEX
+# - heuristic parsing for varied Dhan JSON shapes
+# - MarkdownV2-safe Telegram messages (chunked)
+# - saves raw Dhan LTP response to /tmp for debugging and posts truncated preview to Telegram
+# - handles 429 Retry-After
+# - logs extensively for debugging
+
 import os
-from telegram import Bot
-import requests
-from datetime import datetime
-import logging
+import time
 import json
 import math
-import time
+import logging
+import requests
+import asyncio
+from datetime import datetime
+from telegram import Bot
 
-# Logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ENV
+# -------------------------
+# Configuration / Env
+# -------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 
+# Dhan endpoints
 DHAN_API_BASE = "https://api.dhan.co"
 DHAN_LTP_URL = f"{DHAN_API_BASE}/v2/marketfeed/ltp"
 DHAN_OHLC_URL = f"{DHAN_API_BASE}/v2/marketfeed/ohlc"
 
+# Instruments - display name -> symbol (adjust if your broker expects different)
 INSTRUMENTS = {
     "RELIANCE": "RELIANCE",
     "HDFC Bank": "HDFCBANK",
@@ -55,22 +63,33 @@ INSTRUMENTS = {
 }
 
 INDEX_SYMBOLS = {"NIFTY 50": "NIFTY 50", "SENSEX": "SENSEX"}
+# If you know numeric index IDs for Dhan, put them here (e.g. NIFTY 50 = 13)
 EXTRA_INDEX_IDS = {"NIFTY 50": 13}
 
-# Utilities (same as before)
+# -------------------------
+# Logging
+# -------------------------
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# -------------------------
+# Utilities
+# -------------------------
 def escape_markdown_v2(text: str) -> str:
-    if not text:
-        return text
+    """
+    Escape Telegram MarkdownV2 chars:
+    _ * [ ] ( ) ~ ` > # + - = | { } . !
+    """
+    if not isinstance(text, str):
+        text = str(text)
     to_escape = r'_*[]()~`>#+-=|{}.!'
-    escaped = []
-    for ch in str(text):
-        if ch in to_escape:
-            escaped.append('\\' + ch)
-        else:
-            escaped.append(ch)
-    return ''.join(escaped)
+    return ''.join('\\' + ch if ch in to_escape else ch for ch in text)
 
 def chunk_message(text: str, limit: int = 4000):
+    """Split text into <= limit chunks, trying to preserve line boundaries."""
     if len(text) <= limit:
         return [text]
     lines = text.splitlines(keepends=True)
@@ -83,6 +102,7 @@ def chunk_message(text: str, limit: int = 4000):
             if current:
                 chunks.append(current)
             if len(ln) > limit:
+                # hard split long line
                 for i in range(0, len(ln), limit):
                     chunks.append(ln[i:i+limit])
                 current = ""
@@ -92,11 +112,25 @@ def chunk_message(text: str, limit: int = 4000):
         chunks.append(current)
     return chunks
 
-# NEW: recursive search helpers for raw JSON
+def save_debug_file(resp_text: str):
+    """Save raw response to /tmp with timestamp for inspection."""
+    try:
+        ts = int(time.time())
+        path = f"/tmp/dhan_ltp_debug_{ts}.json"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(resp_text)
+        return path
+    except Exception as e:
+        logger.error("Failed to write debug file: %s", e)
+        return None
+
+def safe_truncate(s: str, n: int = 1200):
+    if not s:
+        return ""
+    return s[:n] + ("" if len(s) <= n else "\n\n...TRUNCATED...")
+
+# Helpers to recursively inspect JSON for numeric leaves
 def recursively_collect_pairs(obj, path=()):
-    """
-    Yield (path_tuple, key, value) for all leaf values inside obj (dict/list/primitive).
-    """
     if isinstance(obj, dict):
         for k, v in obj.items():
             yield from recursively_collect_pairs(v, path + (str(k),))
@@ -104,34 +138,33 @@ def recursively_collect_pairs(obj, path=()):
         for i, v in enumerate(obj):
             yield from recursively_collect_pairs(v, path + (f"[{i}]",))
     else:
-        # primitive leaf
         yield (path, None, obj)
 
 def find_numeric_candidates_for_symbol(raw_json, symbol_variants):
     """
     Search raw_json for numeric leaves whose path or nearby keys include any of the symbol_variants.
-    Returns dict of candidate_name -> numeric_value
+    Return map of variant->candidate_value (best-effort).
     """
     candidates = {}
-    # We'll scan dict nodes and look at keys/values
-    def scan(node, parent_keys):
+    def scan(node):
         if isinstance(node, dict):
-            # Check if any key matches symbol variants
             for k, v in node.items():
                 k_norm = str(k).upper()
+                # If key name itself matches variants, try extract numeric value from v
                 for sym in symbol_variants:
-                    if sym.upper() == k_norm or sym.upper() in k_norm or k_norm in sym.upper():
-                        # try extract numeric from v if primitive or find numeric leaves inside v
+                    su = sym.upper()
+                    if su == k_norm or su in k_norm or k_norm in su:
+                        # try extract numeric from v
                         if isinstance(v, (int, float)):
-                            candidates[sym] = float(v)
+                            candidates.setdefault(sym, float(v))
                         elif isinstance(v, str):
                             try:
-                                candidates[sym] = float(v.replace(",", ""))
+                                candidates.setdefault(sym, float(v.replace(",", "")))
                             except:
                                 pass
-                        elif isinstance(v, dict) or isinstance(v, list):
-                            # search inside for numeric-looking keys like last_price, ltp, last, close
-                            for path, _, leaf in recursively_collect_pairs(v):
+                        elif isinstance(v, (dict, list)):
+                            # search inside v for numeric leaves
+                            for _, _, leaf in recursively_collect_pairs(v):
                                 if isinstance(leaf, (int, float)):
                                     candidates.setdefault(sym, float(leaf))
                                 elif isinstance(leaf, str):
@@ -139,23 +172,25 @@ def find_numeric_candidates_for_symbol(raw_json, symbol_variants):
                                         candidates.setdefault(sym, float(leaf.replace(",", "")))
                                     except:
                                         pass
-                    # Recurse
-                # Recurse normally
-                scan(v, parent_keys + (k,))
+                # recurse
+                scan(v)
         elif isinstance(node, list):
-            for item in node:
-                scan(item, parent_keys + ("[]",))
-        else:
-            return
+            for it in node:
+                scan(it)
     try:
-        scan(raw_json, ())
+        scan(raw_json)
     except Exception as e:
-        logger.debug("Error during raw scan: %s", e)
+        logger.debug("Error during heuristic scan: %s", e)
     return candidates
 
-# Bot class with improved fetch
+# -------------------------
+# BOT CLASS
+# -------------------------
 class MultiLTPBot:
     def __init__(self):
+        if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN]):
+            logger.error("Missing environment variables. Set: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN")
+            raise SystemExit(1)
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.running = True
         self.headers = {
@@ -168,7 +203,7 @@ class MultiLTPBot:
 
     def _build_payload_for_symbols(self):
         symbols = []
-        for display, sym in INSTRUMENTS.items():
+        for disp, sym in INSTRUMENTS.items():
             symbols.append(sym)
         for name, sym in INDEX_SYMBOLS.items():
             symbols.append(sym)
@@ -176,26 +211,46 @@ class MultiLTPBot:
 
     def fetch_symbol_ltps(self):
         """
-        Try standard symbol fetch. If response structure is unexpected, attempt heuristic extraction.
-        Returns dict keyed by symbol -> info dict OR special markers: {"__raw__": raw_json} or {"__429__": retry_after}
+        Try symbol-based LTP fetch. If structure unexpected, fallback to heuristic parsing.
+        Returns:
+          - dict of symbol->info (best-effort)
+          - or {"__raw__": raw_json} if nothing parsed
+          - or {"__429__": retry_after} on rate-limit
         """
         payload = self._build_payload_for_symbols()
         try:
             resp = requests.post(DHAN_LTP_URL, json=payload, headers=self.headers, timeout=10)
             logger.info("LTP API status: %s", resp.status_code)
-            text = resp.text
-            logger.debug("LTP raw (truncated): %s", text[:1500])
+            txt = resp.text
+            logger.debug("LTP raw (truncated): %s", txt[:1500])
+
+            # Save debug file & send preview to Telegram (plain text) for faster debugging
+            try:
+                dbg_path = save_debug_file(txt)
+                if dbg_path:
+                    logger.info("Saved raw LTP response to %s", dbg_path)
+                preview = safe_truncate(txt, 1200)
+                # send preview (plain text) to telegram for debugging - best effort (sync)
+                try:
+                    # Using plain text (no Markdown) to avoid parse errors
+                    self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"DEBUG LTP preview (truncated):\n\n{preview}")
+                except Exception as te:
+                    logger.debug("Could not send debug preview to Telegram: %s", te)
+            except Exception as e:
+                logger.debug("Debug save/preview skipped: %s", e)
+
             if resp.status_code == 429:
                 ra = resp.headers.get("Retry-After")
-                logger.warning("Dhan LTP 429. Retry-After: %s", ra)
+                logger.warning("Dhan LTP rate-limited 429. Retry-After: %s", ra)
                 return {"__429__": ra}
             if resp.status_code != 200:
                 logger.warning("Non-200 from LTP: %s", resp.status_code)
                 return {}
+
             j = resp.json()
             result = {}
 
-            # Common shape check
+            # Standard shape: {"status":"success","data": {"S": { "RELIANCE": {...}, ... } } }
             data = j.get("data") or j
             s_block = data.get("S") if isinstance(data, dict) else None
             if s_block and isinstance(s_block, dict):
@@ -203,7 +258,7 @@ class MultiLTPBot:
                     result[sym] = info
                 return result
 
-            # Try other expected shapes quickly
+            # Sometimes data contains symbol keys directly
             requested = set(self._build_payload_for_symbols().get("S", []))
             if isinstance(data, dict):
                 for k, v in data.items():
@@ -212,50 +267,42 @@ class MultiLTPBot:
             if result:
                 return result
 
-            # If still nothing - fallback to heuristic on the full JSON:
-            logger.info("Falling back to heuristic raw parsing of response JSON")
-            # keep raw j for inspection by caller
+            # Heuristic fallback: scan full JSON for numeric leaves matching symbol variants
+            logger.info("Falling back to heuristic raw parsing of LTP response JSON")
             raw_json = j
 
-            # For each instrument symbol try to extract candidate numeric value(s)
             heuristic_map = {}
             for display_name, sym in INSTRUMENTS.items():
-                # build symbol variants to search for (lots of possible forms)
                 variants = set()
                 variants.add(sym)
                 variants.add(display_name)
-                # also try uppercase/no-spaces versions
                 variants.add(sym.replace(" ", "").upper())
                 variants.add(display_name.replace(" ", "").upper())
-                # try with NSE suffixes commonly used
                 variants.add(sym + ".NS")
                 variants.add(sym + "NSE")
-                # attempt to find any numeric leaf that looks like price
                 candidates = find_numeric_candidates_for_symbol(raw_json, variants)
                 if candidates:
-                    # choose the largest numeric candidate (likely LTP) OR the last one found
-                    # heuristic: prefer keys named like last/ltp/last_price if possible — but we used generic search, so pick max
+                    # choose a best candidate - pick max numeric as heuristic for LTP (or first)
                     try:
                         chosen = max(candidates.values())
-                    except:
+                    except Exception:
                         chosen = list(candidates.values())[0]
                     heuristic_map[sym] = {"last_price": chosen}
             if heuristic_map:
-                logger.info("Heuristic extraction found %d instruments", len(heuristic_map))
+                logger.info("Heuristic found %d instruments", len(heuristic_map))
                 return heuristic_map
 
-            # if no candidates, return raw for inspection
-            logger.warning("Heuristic parsing found no numeric candidates; returning raw JSON for debugging")
+            logger.warning("No data parsed from LTP response; returning raw JSON for inspection")
             return {"__raw__": j}
 
         except requests.exceptions.Timeout:
             logger.error("LTP request timeout")
             return {}
         except requests.exceptions.RequestException as e:
-            logger.error(f"LTP request error: {e}")
+            logger.error("LTP request error: %s", e)
             return {}
         except Exception as e:
-            logger.error(f"Unexpected error in fetch_symbol_ltps: {e}")
+            logger.error("Unexpected error in fetch_symbol_ltps: %s", e)
             return {}
 
     def fetch_index_ohlc(self, index_id):
@@ -263,10 +310,11 @@ class MultiLTPBot:
         try:
             resp = requests.post(DHAN_OHLC_URL, json=payload, headers=self.headers, timeout=10)
             logger.info("Index OHLC status: %s (id=%s)", resp.status_code, index_id)
-            logger.debug("Index OHLC raw: %s", resp.text[:1500])
+            logger.debug("Index OHLC raw (truncated): %s", resp.text[:1500])
+
             if resp.status_code == 429:
                 ra = resp.headers.get("Retry-After")
-                logger.warning("Index OHLC 429. Retry-After: %s", ra)
+                logger.warning("Index OHLC rate-limited 429. Retry-After: %s", ra)
                 return {"__429__": ra}
             if resp.status_code != 200:
                 return None
@@ -277,17 +325,14 @@ class MultiLTPBot:
                 return item
             return None
         except Exception as e:
-            logger.error(f"Error fetching index ohlc: {e}")
+            logger.error("Error fetching index OHLC: %s", e)
             return None
 
-    # build_report_from_data, send_text_safe, send_startup_message, run remain identical to previous
-    # For brevity I reuse simpler versions here (keeps MarkdownV2 escaping and chunking)
-
     def build_report_from_data(self, symbol_ltps, index_ohlcs):
+        """Builds Markdown-friendly multi-line message from parsed data (best-effort)."""
         lines = []
         timestamp = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-        header = f"📊 *MULTI INSTRUMENT LTP*\n🕐 {timestamp}\n\n"
-        lines.append(header)
+        lines.append(f"📊 *MULTI INSTRUMENT LTP*\n🕐 {timestamp}\n\n")
 
         def parse_info(info):
             ltp = None
@@ -357,12 +402,14 @@ class MultiLTPBot:
                     if k in info:
                         try:
                             ltp = float(info[k]); break
-                        except: pass
+                        except:
+                            pass
                 for k in ("prev_close", "close", "prevClose"):
                     if k in info:
                         try:
                             prev = float(info[k]); break
-                        except: pass
+                        except:
+                            pass
                 change = (ltp - prev) if (ltp is not None and prev is not None) else None
                 change_pct = (change / prev * 100) if (change is not None and prev) else None
                 sign = "+" if (change is not None and change >= 0) else ""
@@ -401,11 +448,11 @@ class MultiLTPBot:
                 else:
                     lines.append(f"*{idx_name}*\n• data unavailable\n")
 
-        footer = "_Updated every minute_ ⏱️"
-        lines.append(footer)
+        lines.append("_Updated every minute_ ⏱️")
         return "\n".join(lines)
 
     async def send_text_safe(self, message_text: str):
+        """Send message with MarkdownV2 escaping and chunking, fallback to plain text on failure."""
         chunks = chunk_message(message_text, limit=3900)
         for chunk in chunks:
             escaped = escape_markdown_v2(chunk)
@@ -434,7 +481,7 @@ class MultiLTPBot:
             await self.send_text_safe(msg)
             logger.info("Startup message sent")
         except Exception as e:
-            logger.error(f"Error sending startup message: {e}")
+            logger.error("Error sending startup message: %s", e)
 
     async def run(self):
         logger.info("🚀 Multi-instrument LTP Bot started")
@@ -442,10 +489,13 @@ class MultiLTPBot:
         while self.running:
             try:
                 symbol_ltps = self.fetch_symbol_ltps()
-                # handle rate limit marker
+                # handle 429 marker
                 if isinstance(symbol_ltps, dict) and "__429__" in symbol_ltps:
                     ra = symbol_ltps.get("__429__")
-                    sleep_for = int(ra) if ra and str(ra).isdigit() else 10
+                    try:
+                        sleep_for = int(ra) if ra and str(ra).isdigit() else 10
+                    except:
+                        sleep_for = 10
                     logger.warning("Sleeping %s seconds due to DHAN LTP 429", sleep_for)
                     await asyncio.sleep(sleep_for)
                     continue
@@ -456,7 +506,10 @@ class MultiLTPBot:
                         item = self.fetch_index_ohlc(idx_id)
                         if isinstance(item, dict) and "__429__" in item:
                             ra = item.get("__429__")
-                            sleep_for = int(ra) if ra and str(ra).isdigit() else 10
+                            try:
+                                sleep_for = int(ra) if ra and str(ra).isdigit() else 10
+                            except:
+                                sleep_for = 10
                             logger.warning("Sleeping %s seconds due to DHAN index 429", sleep_for)
                             await asyncio.sleep(sleep_for)
                             continue
@@ -471,17 +524,16 @@ class MultiLTPBot:
                 self.running = False
                 break
             except Exception as e:
-                logger.error(f"Error in main loop: {e}")
+                logger.error("Error in main loop: %s", e)
                 await asyncio.sleep(10)
 
+# -------------------------
+# Run
+# -------------------------
 if __name__ == "__main__":
     try:
-        if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN]):
-            logger.error("❌ Missing environment variables!")
-            logger.error("Please set: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN")
-            exit(1)
         bot = MultiLTPBot()
         asyncio.run(bot.run())
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        exit(1)
+        logger.error("Fatal error: %s", e)
+        raise SystemExit(1)
