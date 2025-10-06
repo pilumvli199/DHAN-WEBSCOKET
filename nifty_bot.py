@@ -3,11 +3,12 @@ import os
 from telegram import Bot
 from datetime import datetime, timedelta
 import logging
-from dhanhq import DhanContext, dhanhq
+from dhanhq import dhanhq
 import matplotlib
 matplotlib.use('Agg')  # Non-GUI backend
 import matplotlib.pyplot as plt
 import io
+import time
 
 # Logging setup
 logging.basicConfig(
@@ -28,7 +29,7 @@ DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 WATCHLIST = {
     "IDX_I": ["13", "26"],  # Nifty 50, Bank Nifty
     "NSE_EQ": [
-        "1333", "11915", "14366", "236", "13",  # HDFC, TCS, Reliance, ITC, Infosys
+        "1333", "11915", "14366", "236", "13"  # HDFC, TCS, Reliance, ITC, Infosys
         # Add 45 more stock IDs here
     ]
 }
@@ -42,9 +43,8 @@ class MultiStockDhanBot:
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.running = True
         
-        # Dhan Context
-        self.dhan_context = DhanContext(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
-        self.dhan = dhanhq(self.dhan_context)
+        # Dhan API
+        self.dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
         
         self.current_expiry = {}
         self.last_update_time = 0
@@ -61,44 +61,66 @@ class MultiStockDhanBot:
             
             logger.info(f"Fetching data for {sum(len(v) for v in securities.values())} instruments")
             
-            response = self.dhan.ohlc_data(securities=securities)
+            response = self.dhan.intraday_minute_data(
+                security_id=str(securities['IDX_I'][0]),
+                exchange_segment='IDX_I',
+                instrument_type='INDEX'
+            )
             
-            if response.get('status') == 'success':
-                data = response.get('data', {})
-                
-                parsed_data = {}
-                for segment, segment_data in data.items():
-                    parsed_data[segment] = {}
-                    for sec_id, sec_data in segment_data.items():
-                        ltp = sec_data.get('last_price', 0)
-                        ohlc = sec_data.get('ohlc', {})
-                        
-                        parsed_data[segment][sec_id] = {
-                            'name': sec_data.get('trading_symbol', sec_id),
-                            'ltp': float(ltp),
-                            'open': float(ohlc.get('open', 0)),
-                            'high': float(ohlc.get('high', 0)),
-                            'low': float(ohlc.get('low', 0)),
-                            'close': float(ohlc.get('close', 0)),
-                            'volume': sec_data.get('volume', 0)
-                        }
-                        
-                        close = parsed_data[segment][sec_id]['close']
-                        if close > 0:
-                            change = ltp - close
-                            parsed_data[segment][sec_id]['change'] = change
-                            parsed_data[segment][sec_id]['change_pct'] = (change / close) * 100
-                        else:
-                            parsed_data[segment][sec_id]['change'] = 0
-                            parsed_data[segment][sec_id]['change_pct'] = 0
-                
-                logger.info(f"Successfully fetched data for {sum(len(v) for v in parsed_data.values())} instruments")
-                return parsed_data
+            logger.info(f"API Response type: {type(response)}")
+            logger.info(f"API Response: {str(response)[:500]}")
             
-            return None
+            # Try individual fetches instead
+            parsed_data = {}
+            
+            for segment, ids in WATCHLIST.items():
+                parsed_data[segment] = {}
+                
+                for sec_id in ids:
+                    try:
+                        # Determine instrument type
+                        instrument_type = "INDEX" if segment == "IDX_I" else "EQUITY"
+                        
+                        # Get LTP
+                        ltp_response = self.dhan.get_ltp_data(
+                            exchange_segment=segment,
+                            security_id=str(sec_id)
+                        )
+                        
+                        if isinstance(ltp_response, dict):
+                            data = ltp_response.get('data', {})
+                            if isinstance(data, dict):
+                                ltp = data.get('LTP', 0)
+                                prev_close = data.get('prev_close', 0)
+                                
+                                if ltp > 0:
+                                    change = ltp - prev_close if prev_close > 0 else 0
+                                    change_pct = (change / prev_close * 100) if prev_close > 0 else 0
+                                    
+                                    parsed_data[segment][sec_id] = {
+                                        'name': data.get('tradingSymbol', sec_id),
+                                        'ltp': float(ltp),
+                                        'open': float(data.get('open', 0)),
+                                        'high': float(data.get('high', 0)),
+                                        'low': float(data.get('low', 0)),
+                                        'close': float(prev_close),
+                                        'volume': data.get('volume', 0),
+                                        'change': change,
+                                        'change_pct': change_pct
+                                    }
+                        
+                        # Rate limit
+                        time.sleep(0.1)
+                        
+                    except Exception as e:
+                        logger.error(f"Error fetching {segment}:{sec_id}: {e}")
+                        continue
+            
+            logger.info(f"Successfully fetched data for {sum(len(v) for v in parsed_data.values())} instruments")
+            return parsed_data if parsed_data else None
             
         except Exception as e:
-            logger.error(f"Error fetching batch data: {e}")
+            logger.error(f"Error fetching batch data: {e}", exc_info=True)
             return None
     
     def get_historical_batch(self, security_ids, segment="NSE_EQ", days=5):
@@ -113,37 +135,42 @@ class MultiStockDhanBot:
                 instrument_type = "INDEX" if segment == "IDX_I" else "EQUITY"
                 
                 response = self.dhan.historical_daily_data(
-                    security_id=sec_id,
+                    security_id=str(sec_id),
                     exchange_segment=segment,
                     instrument_type=instrument_type,
+                    expiry_code=0,
                     from_date=from_date,
                     to_date=to_date
                 )
                 
-                if 'open' in response and 'close' in response:
-                    timestamps = response.get('timestamp', [])
-                    opens = response.get('open', [])
-                    highs = response.get('high', [])
-                    lows = response.get('low', [])
-                    closes = response.get('close', [])
-                    volumes = response.get('volume', [])
-                    
-                    parsed = []
-                    for i in range(len(timestamps)):
-                        parsed.append({
-                            'date': datetime.fromtimestamp(timestamps[i]),
-                            'open': opens[i] if i < len(opens) else 0,
-                            'high': highs[i] if i < len(highs) else 0,
-                            'low': lows[i] if i < len(lows) else 0,
-                            'close': closes[i] if i < len(closes) else 0,
-                            'volume': volumes[i] if i < len(volumes) else 0
-                        })
-                    
-                    historical_data[sec_id] = parsed[-5:]  # Last 5 days
-                    logger.info(f"Historical data fetched for {sec_id}")
+                logger.info(f"Historical response for {sec_id}: {type(response)}")
+                
+                if isinstance(response, dict) and 'data' in response:
+                    data = response['data']
+                    if 'open' in data and 'close' in data:
+                        timestamps = data.get('timestamp', [])
+                        opens = data.get('open', [])
+                        highs = data.get('high', [])
+                        lows = data.get('low', [])
+                        closes = data.get('close', [])
+                        volumes = data.get('volume', [])
+                        
+                        parsed = []
+                        for i in range(len(timestamps)):
+                            parsed.append({
+                                'date': datetime.fromtimestamp(timestamps[i]),
+                                'open': opens[i] if i < len(opens) else 0,
+                                'high': highs[i] if i < len(highs) else 0,
+                                'low': lows[i] if i < len(lows) else 0,
+                                'close': closes[i] if i < len(closes) else 0,
+                                'volume': volumes[i] if i < len(volumes) else 0
+                            })
+                        
+                        historical_data[sec_id] = parsed[-5:]  # Last 5 days
+                        logger.info(f"Historical data fetched for {sec_id}: {len(parsed)} days")
                 
                 # Rate limiting: 3 req/sec
-                asyncio.sleep(0.35)
+                time.sleep(0.35)
                 
             except Exception as e:
                 logger.error(f"Error fetching historical for {sec_id}: {e}")
@@ -195,36 +222,53 @@ class MultiStockDhanBot:
     def get_option_chain(self, underlying_id, segment="IDX_I"):
         """Get option chain for index"""
         try:
+            # Get expiry if not cached
             if underlying_id not in self.current_expiry:
-                expiry_response = self.dhan.expiry_list(
-                    under_security_id=int(underlying_id),
-                    under_exchange_segment=segment
-                )
-                
-                if isinstance(expiry_response, dict) and expiry_response.get('status') == 'success':
-                    expiries = expiry_response.get('data', [])
-                    if expiries:
-                        self.current_expiry[underlying_id] = expiries[0]
-                elif isinstance(expiry_response, list) and expiry_response:
-                    self.current_expiry[underlying_id] = expiry_response[0]
+                try:
+                    expiry_response = self.dhan.get_expiry_list(
+                        exchange_segment=segment,
+                        security_id=str(underlying_id)
+                    )
+                    
+                    logger.info(f"Expiry response type: {type(expiry_response)}")
+                    logger.info(f"Expiry response: {expiry_response}")
+                    
+                    if isinstance(expiry_response, dict) and 'data' in expiry_response:
+                        expiries = expiry_response['data']
+                        if expiries and len(expiries) > 0:
+                            self.current_expiry[underlying_id] = expiries[0]
+                    elif isinstance(expiry_response, list) and expiry_response:
+                        self.current_expiry[underlying_id] = expiry_response[0]
+                        
+                except Exception as e:
+                    logger.error(f"Error getting expiry: {e}")
+                    return None
             
             if underlying_id not in self.current_expiry:
+                logger.error(f"No expiry found for {underlying_id}")
                 return None
             
-            response = self.dhan.option_chain(
-                under_security_id=int(underlying_id),
-                under_exchange_segment=segment,
-                expiry=self.current_expiry[underlying_id]
+            # Get option chain
+            response = self.dhan.get_option_chain(
+                exchange_segment=segment,
+                security_id=str(underlying_id),
+                expiry_code=str(self.current_expiry[underlying_id])
             )
             
-            if response.get('status') == 'success' and 'data' in response:
-                spot_price = response['data'].get('last_price', 0)
-                oc_data = response['data'].get('oc', {})
+            logger.info(f"Option chain response type: {type(response)}")
+            
+            if isinstance(response, dict) and 'data' in response:
+                data = response['data']
+                spot_price = data.get('spot_price', 0)
+                oc_data = data.get('option_chain', {})
                 
                 if not oc_data:
                     return None
                 
                 strikes = sorted([float(s) for s in oc_data.keys()])
+                if not strikes:
+                    return None
+                    
                 atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
                 atm_index = strikes.index(atm_strike)
                 
@@ -235,18 +279,18 @@ class MultiStockDhanBot:
                 
                 option_data = []
                 for strike in selected_strikes:
-                    strike_key = f"{strike:.6f}"
+                    strike_key = str(int(strike))
                     strike_data = oc_data.get(strike_key, {})
                     
-                    ce_data = strike_data.get('ce', {})
-                    pe_data = strike_data.get('pe', {})
+                    ce_data = strike_data.get('call_options', {})
+                    pe_data = strike_data.get('put_options', {})
                     
                     option_data.append({
                         'strike': strike,
-                        'ce_ltp': ce_data.get('last_price', 0),
+                        'ce_ltp': ce_data.get('ltp', 0),
                         'ce_oi': ce_data.get('oi', 0),
                         'ce_volume': ce_data.get('volume', 0),
-                        'pe_ltp': pe_data.get('last_price', 0),
+                        'pe_ltp': pe_data.get('ltp', 0),
                         'pe_oi': pe_data.get('oi', 0),
                         'pe_volume': pe_data.get('volume', 0),
                         'is_atm': (strike == atm_strike)
@@ -262,7 +306,7 @@ class MultiStockDhanBot:
             return None
             
         except Exception as e:
-            logger.error(f"Error option chain: {e}")
+            logger.error(f"Error option chain: {e}", exc_info=True)
             return None
     
     async def send_live_summary(self, live_data):
@@ -271,7 +315,7 @@ class MultiStockDhanBot:
             message = "📊 *MARKET SUMMARY*\n\n"
             
             # Indices first
-            if 'IDX_I' in live_data:
+            if 'IDX_I' in live_data and live_data['IDX_I']:
                 message += "*INDICES*\n```\n"
                 for sec_id, data in live_data['IDX_I'].items():
                     emoji = "🟢" if data['change'] >= 0 else "🔴"
@@ -280,19 +324,20 @@ class MultiStockDhanBot:
                 message += "```\n\n"
             
             # Top gainers/losers
-            if 'NSE_EQ' in live_data:
+            if 'NSE_EQ' in live_data and live_data['NSE_EQ']:
                 stocks = list(live_data['NSE_EQ'].values())
                 stocks.sort(key=lambda x: x['change_pct'], reverse=True)
                 
-                message += "*TOP 5 GAINERS*\n```\n"
-                for stock in stocks[:5]:
+                message += "*TOP GAINERS*\n```\n"
+                for stock in stocks[:min(5, len(stocks))]:
                     message += f"{stock['name']:<12} {stock['ltp']:>8,.1f} 🟢 +{stock['change_pct']:>5.2f}%\n"
                 message += "```\n\n"
                 
-                message += "*TOP 5 LOSERS*\n```\n"
-                for stock in stocks[-5:]:
-                    message += f"{stock['name']:<12} {stock['ltp']:>8,.1f} 🔴 {stock['change_pct']:>5.2f}%\n"
-                message += "```"
+                if len(stocks) > 5:
+                    message += "*TOP LOSERS*\n```\n"
+                    for stock in stocks[-5:]:
+                        message += f"{stock['name']:<12} {stock['ltp']:>8,.1f} 🔴 {stock['change_pct']:>5.2f}%\n"
+                    message += "```"
             
             await self.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
@@ -404,7 +449,7 @@ class MultiStockDhanBot:
                 self.running = False
                 break
             except Exception as e:
-                logger.error(f"Main loop error: {e}")
+                logger.error(f"Main loop error: {e}", exc_info=True)
                 await asyncio.sleep(60)
     
     async def send_startup_message(self):
@@ -416,7 +461,7 @@ class MultiStockDhanBot:
             msg += f"✅ Live data - Every 1 min\n"
             msg += f"✅ Option chains - Every 5 min\n"
             msg += f"✅ Historical charts - Every 30 min\n\n"
-            msg += f"⚡ Batch processing enabled\n"
+            msg += f"⚡ Individual fetching enabled\n"
             msg += f"🚂 Railway.app"
             
             await self.bot.send_message(
@@ -437,5 +482,5 @@ if __name__ == "__main__":
         bot = MultiStockDhanBot()
         asyncio.run(bot.run())
     except Exception as e:
-        logger.error(f"Fatal: {e}")
+        logger.error(f"Fatal: {e}", exc_info=True)
         exit(1)
