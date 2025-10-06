@@ -4,8 +4,7 @@ from telegram import Bot
 import requests
 from datetime import datetime
 import logging
-import pandas as pd
-from io import StringIO
+import csv
 
 # Logging setup
 logging.basicConfig(
@@ -83,39 +82,57 @@ class DhanOptionChainBot:
         logger.info("Bot initialized successfully")
     
     async def load_security_ids(self):
-        """Dhan मधून security IDs load करतो"""
+        """Dhan मधून security IDs load करतो (without pandas)"""
         try:
             logger.info("Loading security IDs from Dhan...")
             response = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
             
             if response.status_code == 200:
-                # CSV parse करतो
-                df = pd.read_csv(StringIO(response.text))
+                # CSV parse करतो manually
+                csv_data = response.text.split('\n')
+                reader = csv.DictReader(csv_data)
                 
                 for symbol, info in STOCKS_INDICES.items():
                     segment = info['segment']
                     symbol_name = info['symbol']
                     
-                    # Security ID शोधतो
-                    if segment == "IDX_I":
-                        # Index साठी
-                        mask = (df['SEM_SEGMENT'] == 'I') & (df['SEM_TRADING_SYMBOL'] == symbol_name)
-                    else:
-                        # Stock साठी
-                        mask = (df['SEM_SEGMENT'] == 'E') & (df['SEM_TRADING_SYMBOL'] == symbol_name) & (df['SEM_EXM_EXCH_ID'] == 'NSE')
+                    # CSV मध्ये शोधतो
+                    for row in reader:
+                        try:
+                            # Index साठी
+                            if segment == "IDX_I":
+                                if (row.get('SEM_SEGMENT') == 'I' and 
+                                    row.get('SEM_TRADING_SYMBOL') == symbol_name):
+                                    sec_id = row.get('SEM_SMST_SECURITY_ID')
+                                    if sec_id:
+                                        self.security_id_map[symbol] = {
+                                            'security_id': int(sec_id),
+                                            'segment': segment,
+                                            'trading_symbol': symbol_name
+                                        }
+                                        logger.info(f"✅ {symbol}: Security ID = {sec_id}")
+                                        break
+                            
+                            # Stock साठी
+                            else:
+                                if (row.get('SEM_SEGMENT') == 'E' and 
+                                    row.get('SEM_TRADING_SYMBOL') == symbol_name and
+                                    row.get('SEM_EXM_EXCH_ID') == 'NSE'):
+                                    sec_id = row.get('SEM_SMST_SECURITY_ID')
+                                    if sec_id:
+                                        self.security_id_map[symbol] = {
+                                            'security_id': int(sec_id),
+                                            'segment': segment,
+                                            'trading_symbol': symbol_name
+                                        }
+                                        logger.info(f"✅ {symbol}: Security ID = {sec_id}")
+                                        break
+                        except Exception as e:
+                            continue
                     
-                    filtered = df[mask]
-                    
-                    if not filtered.empty:
-                        sec_id = filtered.iloc[0]['SEM_SMST_SECURITY_ID']
-                        self.security_id_map[symbol] = {
-                            'security_id': int(sec_id),
-                            'segment': segment,
-                            'trading_symbol': symbol_name
-                        }
-                        logger.info(f"✅ {symbol}: Security ID = {sec_id}")
-                    else:
-                        logger.warning(f"❌ {symbol}: Security ID नाही मिळाला!")
+                    # Reset CSV reader for next symbol
+                    csv_data_reset = response.text.split('\n')
+                    reader = csv.DictReader(csv_data_reset)
                 
                 logger.info(f"Total {len(self.security_id_map)} securities loaded")
                 return True
