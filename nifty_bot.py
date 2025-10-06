@@ -25,6 +25,7 @@ DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 
 # Dhan API URLs
 DHAN_API_BASE = "https://api.dhan.co"
+DHAN_OHLC_URL = f"{DHAN_API_BASE}/v2/marketfeed/ohlc"
 DHAN_OPTION_CHAIN_URL = f"{DHAN_API_BASE}/v2/optionchain"
 DHAN_EXPIRY_LIST_URL = f"{DHAN_API_BASE}/v2/optionchain/expirylist"
 DHAN_HISTORICAL_URL = f"{DHAN_API_BASE}/v2/charts/historical"
@@ -89,6 +90,54 @@ class NiftyWebSocketBot:
             return None
         except Exception as e:
             logger.error(f"Error getting expiry: {e}")
+            return None
+    
+    def get_nifty_ltp(self):
+        """REST API - Nifty 50 LTP (fallback)"""
+        try:
+            payload = {
+                "IDX_I": [NIFTY_50_SECURITY_ID]
+            }
+            
+            response = requests.post(
+                DHAN_OHLC_URL,
+                json=payload,
+                headers=self.headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data.get('status') == 'success' and 'data' in data:
+                    idx_data = data['data'].get('IDX_I', {})
+                    nifty_data = idx_data.get(str(NIFTY_50_SECURITY_ID), {})
+                    
+                    if nifty_data and 'last_price' in nifty_data:
+                        ltp = nifty_data['last_price']
+                        ohlc = nifty_data.get('ohlc', {})
+                        
+                        result = {
+                            'ltp': ltp,
+                            'open': ohlc.get('open', 0),
+                            'high': ohlc.get('high', 0),
+                            'low': ohlc.get('low', 0),
+                            'close': ohlc.get('close', 0)
+                        }
+                        
+                        if result['close'] > 0:
+                            result['change'] = ltp - result['close']
+                            result['change_pct'] = (result['change'] / result['close']) * 100
+                        else:
+                            result['change'] = 0
+                            result['change_pct'] = 0
+                        
+                        return result
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting LTP: {e}")
             return None
     
     def get_historical_data(self, days=5):
@@ -232,71 +281,102 @@ class NiftyWebSocketBot:
     async def connect_websocket(self):
         """WebSocket connection बनवतो"""
         try:
-            self.ws = await websockets.connect(DHAN_WS_URL)
-            logger.info("✅ WebSocket connected")
-            
-            # Authentication message
-            auth_msg = {
-                "a": WS_CONNECT,
-                "b": {
-                    "Authorization": f"Bearer {DHAN_ACCESS_TOKEN}",
-                    "client_id": DHAN_CLIENT_ID
-                }
+            # Dhan WebSocket needs headers
+            headers = {
+                "Authorization": f"{DHAN_ACCESS_TOKEN}",
+                "client-id": DHAN_CLIENT_ID
             }
             
-            await self.ws.send(json.dumps(auth_msg))
-            logger.info("🔐 Authentication sent")
+            logger.info(f"🔌 Connecting to {DHAN_WS_URL}")
+            self.ws = await websockets.connect(
+                DHAN_WS_URL,
+                extra_headers=headers,
+                ping_interval=20,
+                ping_timeout=10
+            )
+            logger.info("✅ WebSocket connected")
             
-            # Subscribe to Nifty 50
+            # Wait for connection confirmation
+            await asyncio.sleep(1)
+            
+            # Subscribe to Nifty 50 Index
+            # Dhan format: {"RequestCode":15,"InstrumentType":1,"SecurityId":"13"}
             subscribe_msg = {
-                "a": WS_SUBSCRIBE,
-                "b": {
-                    "instrumentType": 1,  # Index
-                    "securityId": str(NIFTY_50_SECURITY_ID)
-                }
+                "RequestCode": 15,
+                "InstrumentType": 1,
+                "SecurityId": str(NIFTY_50_SECURITY_ID)
             }
             
             await self.ws.send(json.dumps(subscribe_msg))
             logger.info(f"📊 Subscribed to Nifty 50 (ID: {NIFTY_50_SECURITY_ID})")
+            logger.info(f"📤 Sent: {subscribe_msg}")
             
             return True
             
         except Exception as e:
-            logger.error(f"WebSocket connection error: {e}")
+            logger.error(f"❌ WebSocket connection error: {e}")
+            logger.exception("Full traceback:")
             return False
     
     def parse_websocket_message(self, data: Dict) -> Dict:
         """WebSocket message parse करतो"""
         try:
-            # Dhan WebSocket format (adjust based on actual response)
+            logger.info(f"🔍 Parsing data keys: {data.keys() if isinstance(data, dict) else type(data)}")
+            
+            # Dhan WebSocket format variations
             if isinstance(data, dict):
-                ltp = data.get('LTP', data.get('last_price', 0))
-                open_price = data.get('open', 0)
-                high = data.get('high', 0)
-                low = data.get('low', 0)
-                close = data.get('close', data.get('prev_close', 0))
+                # Try different field names
+                ltp = (data.get('LTP') or 
+                       data.get('ltp') or 
+                       data.get('last_price') or 
+                       data.get('lastPrice') or 
+                       data.get('close') or 0)
+                
+                open_price = (data.get('open') or 
+                             data.get('Open') or 
+                             data.get('openPrice') or 0)
+                
+                high = (data.get('high') or 
+                       data.get('High') or 
+                       data.get('highPrice') or 0)
+                
+                low = (data.get('low') or 
+                      data.get('Low') or 
+                      data.get('lowPrice') or 0)
+                
+                close = (data.get('close') or 
+                        data.get('Close') or 
+                        data.get('prev_close') or 
+                        data.get('prevClose') or 0)
+                
+                # If no LTP found, return None
+                if ltp == 0:
+                    logger.warning(f"⚠️ No LTP found in data: {list(data.keys())}")
+                    return None
                 
                 result = {
-                    'ltp': ltp,
-                    'open': open_price,
-                    'high': high,
-                    'low': low,
-                    'close': close
+                    'ltp': float(ltp),
+                    'open': float(open_price),
+                    'high': float(high),
+                    'low': float(low),
+                    'close': float(close)
                 }
                 
-                if close > 0:
-                    result['change'] = ltp - close
-                    result['change_pct'] = (result['change'] / close) * 100
+                if result['close'] > 0:
+                    result['change'] = result['ltp'] - result['close']
+                    result['change_pct'] = (result['change'] / result['close']) * 100
                 else:
                     result['change'] = 0
                     result['change_pct'] = 0
                 
+                logger.info(f"✅ Parsed LTP: {result['ltp']:.2f}")
                 return result
             
             return None
             
         except Exception as e:
-            logger.error(f"Error parsing WS message: {e}")
+            logger.error(f"❌ Error parsing WS message: {e}")
+            logger.exception("Parse error details:")
             return None
     
     async def handle_websocket_messages(self):
@@ -304,10 +384,24 @@ class NiftyWebSocketBot:
         try:
             async for message in self.ws:
                 try:
+                    logger.info(f"📥 Raw WS Message: {message[:200]}")  # First 200 chars
+                    
                     data = json.loads(message)
+                    logger.info(f"📦 Parsed Data: {data}")
+                    
+                    # Dhan WebSocket response format check
+                    # Format 1: {"type":"ticker","data":{...}}
+                    # Format 2: Direct data object
+                    
+                    actual_data = data
+                    if isinstance(data, dict):
+                        if 'data' in data:
+                            actual_data = data['data']
+                        elif 'type' in data and data['type'] == 'ticker':
+                            actual_data = data.get('data', data)
                     
                     # Parse the message
-                    parsed = self.parse_websocket_message(data)
+                    parsed = self.parse_websocket_message(actual_data)
                     
                     if parsed:
                         self.last_ltp_data = parsed
@@ -317,18 +411,22 @@ class NiftyWebSocketBot:
                         if current_time - self.last_message_time >= self.message_interval:
                             await self.send_nifty_ltp(parsed)
                             self.last_message_time = current_time
-                            logger.info(f"📊 LTP: {parsed['ltp']:.2f}")
+                            logger.info(f"📊 LTP Updated: {parsed['ltp']:.2f}")
+                    else:
+                        logger.warning(f"⚠️ Could not parse: {actual_data}")
                 
-                except json.JSONDecodeError:
-                    logger.warning("Invalid JSON received")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Invalid JSON: {message[:100]} | Error: {e}")
                 except Exception as e:
                     logger.error(f"Error processing message: {e}")
+                    logger.exception("Full error:")
                     
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning("⚠️ WebSocket connection closed")
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.warning(f"⚠️ WebSocket connection closed: {e}")
             return False
         except Exception as e:
             logger.error(f"WebSocket handler error: {e}")
+            logger.exception("Full traceback:")
             return False
         
         return True
@@ -461,7 +559,7 @@ class NiftyWebSocketBot:
                 logger.error(f"Option chain task error: {e}")
     
     async def run(self):
-        """Main WebSocket loop"""
+        """Main WebSocket loop with REST API fallback"""
         logger.info("🚀 WebSocket Bot started!")
         
         await self.send_startup_message()
@@ -478,12 +576,32 @@ class NiftyWebSocketBot:
         # Start option chain background task
         asyncio.create_task(self.option_chain_task())
         
+        # Try WebSocket first
+        ws_failed_count = 0
+        use_rest_fallback = False
+        
         while self.running:
             try:
-                # Connect WebSocket
-                if await self.connect_websocket():
-                    # Handle messages
-                    await self.handle_websocket_messages()
+                if not use_rest_fallback and ws_failed_count < 3:
+                    # Try WebSocket
+                    logger.info("🔌 Attempting WebSocket connection...")
+                    if await self.connect_websocket():
+                        ws_failed_count = 0
+                        # Handle messages
+                        success = await self.handle_websocket_messages()
+                        if not success:
+                            ws_failed_count += 1
+                    else:
+                        ws_failed_count += 1
+                    
+                    if ws_failed_count >= 3:
+                        logger.warning("⚠️ WebSocket failed 3 times, switching to REST API fallback")
+                        use_rest_fallback = True
+                
+                if use_rest_fallback:
+                    # REST API fallback
+                    logger.info("🔄 Using REST API mode...")
+                    await self.rest_api_loop()
                 
                 logger.warning("⚠️ Reconnecting in 5 seconds...")
                 await asyncio.sleep(5)
@@ -494,11 +612,29 @@ class NiftyWebSocketBot:
                 break
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
+                logger.exception("Error details:")
                 await asyncio.sleep(5)
         
         # Cleanup
         if self.ws:
             await self.ws.close()
+    
+    async def rest_api_loop(self):
+        """REST API fallback loop"""
+        logger.info("📡 REST API mode activated")
+        for i in range(60):  # Run for 60 iterations then retry WebSocket
+            try:
+                nifty = self.get_nifty_ltp()
+                if nifty:
+                    await self.send_nifty_ltp(nifty)
+                    self.last_ltp_data = nifty
+                
+                await asyncio.sleep(60)
+            except Exception as e:
+                logger.error(f"REST API error: {e}")
+                break
+        
+        logger.info("🔄 Retrying WebSocket...")
     
     async def send_startup_message(self):
         """Startup message"""
