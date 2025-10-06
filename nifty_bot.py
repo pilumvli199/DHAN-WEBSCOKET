@@ -53,27 +53,42 @@ class NiftyDhanBot:
         
         # Queue for WebSocket data
         self.data_queue = queue.Queue()
+        self.use_rest_api = False  # Fallback flag
         
         logger.info("✅ Dhan Bot initialized")
     
     def get_nearest_expiry(self):
         """Nearest expiry date"""
         try:
+            logger.info("📅 Fetching expiry list...")
             response = self.dhan.expiry_list(
                 under_security_id=int(NIFTY_50_SECURITY_ID),
                 under_exchange_segment=NIFTY_SEGMENT
             )
             
-            if isinstance(response, dict) and response.get('status') == 'success':
-                expiries = response.get('data', [])
-                if expiries:
-                    self.current_expiry = expiries[0]
-                    logger.info(f"📅 Nearest expiry: {self.current_expiry}")
-                    return self.current_expiry
+            logger.info(f"Expiry response: {response}")
             
+            if isinstance(response, dict):
+                if response.get('status') == 'success':
+                    expiries = response.get('data', [])
+                    if expiries:
+                        self.current_expiry = expiries[0]
+                        logger.info(f"✅ Nearest expiry: {self.current_expiry}")
+                        return self.current_expiry
+                else:
+                    logger.warning(f"Expiry API returned: {response}")
+            elif isinstance(response, list) and response:
+                # Sometimes API returns list directly
+                self.current_expiry = response[0]
+                logger.info(f"✅ Nearest expiry: {self.current_expiry}")
+                return self.current_expiry
+            
+            logger.error("❌ No expiry data available")
             return None
+            
         except Exception as e:
             logger.error(f"Error getting expiry: {e}")
+            logger.exception("Full traceback:")
             return None
     
     def get_historical_data(self, days=5):
@@ -232,21 +247,36 @@ class NiftyDhanBot:
         try:
             logger.info("🔌 Starting Dhan WebSocket...")
             
-            while self.running:
-                try:
-                    # Get data from WebSocket (blocking call)
-                    response = self.market_feed.get_data()
-                    
-                    if response:
-                        # Put data in queue for async processing
-                        self.data_queue.put(response)
-                        logger.debug("📡 Data received")
-                    
-                    time.sleep(0.1)  # Small delay
-                    
-                except Exception as e:
-                    logger.error(f"WebSocket worker error: {e}")
-                    time.sleep(5)
+            # Connect to WebSocket first
+            try:
+                logger.info("🔗 Connecting to Dhan WebSocket...")
+                self.market_feed.run_forever()  # This is blocking and handles connection
+            except Exception as e:
+                logger.error(f"Failed to start WebSocket: {e}")
+                logger.info("🔄 Trying alternative connection method...")
+                
+                # Alternative: Manual connection loop
+                while self.running:
+                    try:
+                        # Try to get data (will auto-connect)
+                        response = self.market_feed.get_data()
+                        
+                        if response:
+                            self.data_queue.put(response)
+                            logger.debug("📡 Data received")
+                        else:
+                            logger.warning("⚠️ No data received, reconnecting...")
+                            time.sleep(5)
+                        
+                        time.sleep(0.5)
+                        
+                    except AttributeError as e:
+                        logger.error(f"WebSocket not connected: {e}")
+                        logger.info("⏳ Waiting 10 seconds before retry...")
+                        time.sleep(10)
+                    except Exception as e:
+                        logger.error(f"WebSocket error: {e}")
+                        time.sleep(5)
                     
         except Exception as e:
             logger.error(f"Fatal WebSocket error: {e}")
