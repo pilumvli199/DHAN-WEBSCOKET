@@ -3,7 +3,7 @@ import os
 from telegram import Bot
 from datetime import datetime, timedelta
 import logging
-from dhanhq import dhanhq
+from dhanhq import dhanhq, marketfeed
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -75,8 +75,8 @@ class MultiStockDhanBot:
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.running = True
         
-        # Dhan API - only takes access token
-        self.dhan = dhanhq(DHAN_ACCESS_TOKEN)
+        # Dhan API - needs client_id and access_token
+        self.dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
         
         self.current_expiry = {}
         self.last_chart_time = {}
