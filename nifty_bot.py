@@ -75,8 +75,8 @@ class MultiStockDhanBot:
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.running = True
         
-        # Dhan API - needs client_id and access_token
-        self.dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+        # Dhan API - only takes access token
+        self.dhan = dhanhq(DHAN_ACCESS_TOKEN)
         
         self.current_expiry = {}
         self.last_chart_time = {}
