@@ -3,10 +3,11 @@ import os
 from telegram import Bot
 from datetime import datetime, timedelta
 import logging
-from dhanhq import DhanContext, MarketFeed, dhanhq
-import threading
-import time
-import queue
+from dhanhq import DhanContext, dhanhq
+import matplotlib
+matplotlib.use('Agg')  # Non-GUI backend
+import matplotlib.pyplot as plt
+import io
 
 # Logging setup
 logging.basicConfig(
@@ -23,128 +24,197 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 
-# Nifty 50 Config
-NIFTY_50_SECURITY_ID = "13"
-NIFTY_SEGMENT = "IDX_I"
+# Watchlist: 50 Stocks + 2 Indices
+WATCHLIST = {
+    "IDX_I": ["13", "26"],  # Nifty 50, Bank Nifty
+    "NSE_EQ": [
+        "1333", "11915", "14366", "236", "13",  # HDFC, TCS, Reliance, ITC, Infosys
+        # Add 45 more stock IDs here
+    ]
+}
 
 # ========================
-# SYNC + ASYNC BOT
+# MULTI-STOCK BOT
 # ========================
 
-class NiftyDhanBot:
+class MultiStockDhanBot:
     def __init__(self):
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.running = True
         
-        # Dhan Context Setup
+        # Dhan Context
         self.dhan_context = DhanContext(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
         self.dhan = dhanhq(self.dhan_context)
         
-        # Market Feed Setup
-        instruments = [
-            (MarketFeed.IDX, NIFTY_50_SECURITY_ID, MarketFeed.Full)
-        ]
-        self.market_feed = MarketFeed(self.dhan_context, instruments, "v2")
+        self.current_expiry = {}
+        self.last_update_time = 0
         
-        self.current_expiry = None
-        self.last_ltp_data = None
-        self.last_message_time = 0
-        self.message_interval = 60
-        
-        # Queue for WebSocket data
-        self.data_queue = queue.Queue()
-        self.use_rest_api = False  # Fallback flag
-        
-        logger.info("✅ Dhan Bot initialized")
+        logger.info("Multi-Stock Bot initialized")
     
-    def get_nearest_expiry(self):
-        """Nearest expiry date"""
+    def get_live_data_batch(self):
+        """Batch fetch live data for all instruments"""
         try:
-            logger.info("📅 Fetching expiry list...")
-            response = self.dhan.expiry_list(
-                under_security_id=int(NIFTY_50_SECURITY_ID),
-                under_exchange_segment=NIFTY_SEGMENT
-            )
+            # Convert string IDs to integers for API
+            securities = {}
+            for segment, ids in WATCHLIST.items():
+                securities[segment] = [int(sid) for sid in ids]
             
-            logger.info(f"Expiry response: {response}")
+            logger.info(f"Fetching data for {sum(len(v) for v in securities.values())} instruments")
             
-            if isinstance(response, dict):
-                if response.get('status') == 'success':
-                    expiries = response.get('data', [])
+            response = self.dhan.ohlc_data(securities=securities)
+            
+            if response.get('status') == 'success':
+                data = response.get('data', {})
+                
+                parsed_data = {}
+                for segment, segment_data in data.items():
+                    parsed_data[segment] = {}
+                    for sec_id, sec_data in segment_data.items():
+                        ltp = sec_data.get('last_price', 0)
+                        ohlc = sec_data.get('ohlc', {})
+                        
+                        parsed_data[segment][sec_id] = {
+                            'name': sec_data.get('trading_symbol', sec_id),
+                            'ltp': float(ltp),
+                            'open': float(ohlc.get('open', 0)),
+                            'high': float(ohlc.get('high', 0)),
+                            'low': float(ohlc.get('low', 0)),
+                            'close': float(ohlc.get('close', 0)),
+                            'volume': sec_data.get('volume', 0)
+                        }
+                        
+                        close = parsed_data[segment][sec_id]['close']
+                        if close > 0:
+                            change = ltp - close
+                            parsed_data[segment][sec_id]['change'] = change
+                            parsed_data[segment][sec_id]['change_pct'] = (change / close) * 100
+                        else:
+                            parsed_data[segment][sec_id]['change'] = 0
+                            parsed_data[segment][sec_id]['change_pct'] = 0
+                
+                logger.info(f"Successfully fetched data for {sum(len(v) for v in parsed_data.values())} instruments")
+                return parsed_data
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error fetching batch data: {e}")
+            return None
+    
+    def get_historical_batch(self, security_ids, segment="NSE_EQ", days=5):
+        """Batch fetch historical data with rate limiting"""
+        historical_data = {}
+        
+        to_date = datetime.now().strftime("%Y-%m-%d")
+        from_date = (datetime.now() - timedelta(days=days+2)).strftime("%Y-%m-%d")
+        
+        for sec_id in security_ids:
+            try:
+                instrument_type = "INDEX" if segment == "IDX_I" else "EQUITY"
+                
+                response = self.dhan.historical_daily_data(
+                    security_id=sec_id,
+                    exchange_segment=segment,
+                    instrument_type=instrument_type,
+                    from_date=from_date,
+                    to_date=to_date
+                )
+                
+                if 'open' in response and 'close' in response:
+                    timestamps = response.get('timestamp', [])
+                    opens = response.get('open', [])
+                    highs = response.get('high', [])
+                    lows = response.get('low', [])
+                    closes = response.get('close', [])
+                    volumes = response.get('volume', [])
+                    
+                    parsed = []
+                    for i in range(len(timestamps)):
+                        parsed.append({
+                            'date': datetime.fromtimestamp(timestamps[i]),
+                            'open': opens[i] if i < len(opens) else 0,
+                            'high': highs[i] if i < len(highs) else 0,
+                            'low': lows[i] if i < len(lows) else 0,
+                            'close': closes[i] if i < len(closes) else 0,
+                            'volume': volumes[i] if i < len(volumes) else 0
+                        })
+                    
+                    historical_data[sec_id] = parsed[-5:]  # Last 5 days
+                    logger.info(f"Historical data fetched for {sec_id}")
+                
+                # Rate limiting: 3 req/sec
+                asyncio.sleep(0.35)
+                
+            except Exception as e:
+                logger.error(f"Error fetching historical for {sec_id}: {e}")
+        
+        return historical_data
+    
+    def generate_chart(self, historical_data, title="Stock Chart"):
+        """Generate PNG chart from historical data"""
+        try:
+            if not historical_data:
+                return None
+            
+            dates = [d['date'] for d in historical_data]
+            closes = [d['close'] for d in historical_data]
+            
+            # Create figure
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            # Plot line chart
+            ax.plot(dates, closes, marker='o', linewidth=2, markersize=6, color='#2196F3')
+            ax.fill_between(dates, closes, alpha=0.3, color='#2196F3')
+            
+            # Formatting
+            ax.set_title(title, fontsize=14, fontweight='bold')
+            ax.set_xlabel('Date', fontsize=10)
+            ax.set_ylabel('Price (₹)', fontsize=10)
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(axis='x', rotation=45)
+            
+            # Add values on points
+            for i, (date, price) in enumerate(zip(dates, closes)):
+                ax.text(date, price, f'₹{price:.1f}', 
+                       ha='center', va='bottom', fontsize=8)
+            
+            plt.tight_layout()
+            
+            # Save to bytes
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            buf.seek(0)
+            plt.close()
+            
+            return buf
+            
+        except Exception as e:
+            logger.error(f"Error generating chart: {e}")
+            return None
+    
+    def get_option_chain(self, underlying_id, segment="IDX_I"):
+        """Get option chain for index"""
+        try:
+            if underlying_id not in self.current_expiry:
+                expiry_response = self.dhan.expiry_list(
+                    under_security_id=int(underlying_id),
+                    under_exchange_segment=segment
+                )
+                
+                if isinstance(expiry_response, dict) and expiry_response.get('status') == 'success':
+                    expiries = expiry_response.get('data', [])
                     if expiries:
-                        self.current_expiry = expiries[0]
-                        logger.info(f"✅ Nearest expiry: {self.current_expiry}")
-                        return self.current_expiry
-                else:
-                    logger.warning(f"Expiry API returned: {response}")
-            elif isinstance(response, list) and response:
-                # Sometimes API returns list directly
-                self.current_expiry = response[0]
-                logger.info(f"✅ Nearest expiry: {self.current_expiry}")
-                return self.current_expiry
+                        self.current_expiry[underlying_id] = expiries[0]
+                elif isinstance(expiry_response, list) and expiry_response:
+                    self.current_expiry[underlying_id] = expiry_response[0]
             
-            logger.error("❌ No expiry data available")
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error getting expiry: {e}")
-            logger.exception("Full traceback:")
-            return None
-    
-    def get_historical_data(self, days=5):
-        """Historical data using Dhan API"""
-        try:
-            to_date = datetime.now().strftime("%Y-%m-%d")
-            from_date = (datetime.now() - timedelta(days=days+2)).strftime("%Y-%m-%d")
-            
-            response = self.dhan.historical_daily_data(
-                security_id=NIFTY_50_SECURITY_ID,
-                exchange_segment=NIFTY_SEGMENT,
-                instrument_type="INDEX",
-                from_date=from_date,
-                to_date=to_date
-            )
-            
-            if 'open' in response and 'close' in response:
-                timestamps = response.get('timestamp', [])
-                opens = response.get('open', [])
-                highs = response.get('high', [])
-                lows = response.get('low', [])
-                closes = response.get('close', [])
-                volumes = response.get('volume', [])
-                
-                parsed_data = []
-                for i in range(len(timestamps)):
-                    parsed_data.append({
-                        'date': datetime.fromtimestamp(timestamps[i]).strftime('%Y-%m-%d'),
-                        'open': opens[i] if i < len(opens) else 0,
-                        'high': highs[i] if i < len(highs) else 0,
-                        'low': lows[i] if i < len(lows) else 0,
-                        'close': closes[i] if i < len(closes) else 0,
-                        'volume': volumes[i] if i < len(volumes) else 0
-                    })
-                
-                return parsed_data[-5:]
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error getting historical: {e}")
-            return None
-    
-    def get_option_chain_with_greeks(self):
-        """Option Chain using Dhan API"""
-        try:
-            if not self.current_expiry:
-                self.get_nearest_expiry()
-            
-            if not self.current_expiry:
+            if underlying_id not in self.current_expiry:
                 return None
             
             response = self.dhan.option_chain(
-                under_security_id=int(NIFTY_50_SECURITY_ID),
-                under_exchange_segment=NIFTY_SEGMENT,
-                expiry=self.current_expiry
+                under_security_id=int(underlying_id),
+                under_exchange_segment=segment,
+                expiry=self.current_expiry[underlying_id]
             )
             
             if response.get('status') == 'success' and 'data' in response:
@@ -158,6 +228,7 @@ class NiftyDhanBot:
                 atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
                 atm_index = strikes.index(atm_strike)
                 
+                # 5 strikes around ATM
                 start_idx = max(0, atm_index - 5)
                 end_idx = min(len(strikes), atm_index + 6)
                 selected_strikes = strikes[start_idx:end_idx]
@@ -169,34 +240,22 @@ class NiftyDhanBot:
                     
                     ce_data = strike_data.get('ce', {})
                     pe_data = strike_data.get('pe', {})
-                    ce_greeks = ce_data.get('greeks', {})
-                    pe_greeks = pe_data.get('greeks', {})
                     
                     option_data.append({
                         'strike': strike,
                         'ce_ltp': ce_data.get('last_price', 0),
                         'ce_oi': ce_data.get('oi', 0),
                         'ce_volume': ce_data.get('volume', 0),
-                        'ce_iv': ce_data.get('implied_volatility', 0),
-                        'ce_delta': ce_greeks.get('delta', 0),
-                        'ce_theta': ce_greeks.get('theta', 0),
-                        'ce_gamma': ce_greeks.get('gamma', 0),
-                        'ce_vega': ce_greeks.get('vega', 0),
                         'pe_ltp': pe_data.get('last_price', 0),
                         'pe_oi': pe_data.get('oi', 0),
                         'pe_volume': pe_data.get('volume', 0),
-                        'pe_iv': pe_data.get('implied_volatility', 0),
-                        'pe_delta': pe_greeks.get('delta', 0),
-                        'pe_theta': pe_greeks.get('theta', 0),
-                        'pe_gamma': pe_greeks.get('gamma', 0),
-                        'pe_vega': pe_greeks.get('vega', 0),
                         'is_atm': (strike == atm_strike)
                     })
                 
                 return {
                     'spot': spot_price,
                     'atm': atm_strike,
-                    'expiry': self.current_expiry,
+                    'expiry': self.current_expiry[underlying_id],
                     'options': option_data
                 }
             
@@ -206,110 +265,67 @@ class NiftyDhanBot:
             logger.error(f"Error option chain: {e}")
             return None
     
-    def parse_market_feed(self, data):
-        """Parse Dhan market feed data"""
+    async def send_live_summary(self, live_data):
+        """Send live market summary"""
         try:
-            if not data or not isinstance(data, dict):
-                return None
+            message = "📊 *MARKET SUMMARY*\n\n"
             
-            ltp = data.get('LTP', data.get('last_price', 0))
-            open_price = data.get('open', 0)
-            high = data.get('high', 0)
-            low = data.get('low', 0)
-            close = data.get('close', data.get('prev_close', 0))
+            # Indices first
+            if 'IDX_I' in live_data:
+                message += "*INDICES*\n```\n"
+                for sec_id, data in live_data['IDX_I'].items():
+                    emoji = "🟢" if data['change'] >= 0 else "🔴"
+                    sign = "+" if data['change'] >= 0 else ""
+                    message += f"{data['name']:<12} {data['ltp']:>8,.1f} {emoji} {sign}{data['change_pct']:>5.2f}%\n"
+                message += "```\n\n"
             
-            if ltp == 0:
-                return None
-            
-            result = {
-                'ltp': float(ltp),
-                'open': float(open_price),
-                'high': float(high),
-                'low': float(low),
-                'close': float(close)
-            }
-            
-            if result['close'] > 0:
-                result['change'] = result['ltp'] - result['close']
-                result['change_pct'] = (result['change'] / result['close']) * 100
-            else:
-                result['change'] = 0
-                result['change_pct'] = 0
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error parsing feed: {e}")
-            return None
-    
-    def websocket_worker(self):
-        """WebSocket worker thread (sync)"""
-        try:
-            logger.info("🔌 Starting Dhan WebSocket...")
-            
-            # Connect to WebSocket first
-            try:
-                logger.info("🔗 Connecting to Dhan WebSocket...")
-                self.market_feed.run_forever()  # This is blocking and handles connection
-            except Exception as e:
-                logger.error(f"Failed to start WebSocket: {e}")
-                logger.info("🔄 Trying alternative connection method...")
+            # Top gainers/losers
+            if 'NSE_EQ' in live_data:
+                stocks = list(live_data['NSE_EQ'].values())
+                stocks.sort(key=lambda x: x['change_pct'], reverse=True)
                 
-                # Alternative: Manual connection loop
-                while self.running:
-                    try:
-                        # Try to get data (will auto-connect)
-                        response = self.market_feed.get_data()
-                        
-                        if response:
-                            self.data_queue.put(response)
-                            logger.debug("📡 Data received")
-                        else:
-                            logger.warning("⚠️ No data received, reconnecting...")
-                            time.sleep(5)
-                        
-                        time.sleep(0.5)
-                        
-                    except AttributeError as e:
-                        logger.error(f"WebSocket not connected: {e}")
-                        logger.info("⏳ Waiting 10 seconds before retry...")
-                        time.sleep(10)
-                    except Exception as e:
-                        logger.error(f"WebSocket error: {e}")
-                        time.sleep(5)
-                    
+                message += "*TOP 5 GAINERS*\n```\n"
+                for stock in stocks[:5]:
+                    message += f"{stock['name']:<12} {stock['ltp']:>8,.1f} 🟢 +{stock['change_pct']:>5.2f}%\n"
+                message += "```\n\n"
+                
+                message += "*TOP 5 LOSERS*\n```\n"
+                for stock in stocks[-5:]:
+                    message += f"{stock['name']:<12} {stock['ltp']:>8,.1f} 🔴 {stock['change_pct']:>5.2f}%\n"
+                message += "```"
+            
+            await self.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=message,
+                parse_mode='Markdown'
+            )
+            logger.info("Live summary sent")
+            
         except Exception as e:
-            logger.error(f"Fatal WebSocket error: {e}")
-        finally:
-            try:
-                self.market_feed.disconnect()
-            except:
-                pass
+            logger.error(f"Error sending summary: {e}")
     
-    async def send_option_chain_message(self, option_data):
-        """Option Chain telegram message"""
+    async def send_option_chain_message(self, name, option_data):
+        """Send option chain"""
         try:
-            message = f"📊 *OPTION CHAIN*\n"
+            message = f"📊 *OPTION CHAIN - {name}*\n"
             message += f"📅 Expiry: {option_data['expiry']}\n"
             message += f"💰 Spot: ₹{option_data['spot']:,.2f}\n"
             message += f"🎯 ATM: ₹{option_data['atm']:,.0f}\n\n"
             
             message += "```\n"
-            message += "Strike   CE-LTP  CE-OI  CE-Vol  PE-LTP  PE-OI  PE-Vol\n"
-            message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            message += "Strike   CE-LTP  CE-OI   PE-LTP  PE-OI\n"
+            message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             
             for opt in option_data['options']:
                 atm = "🔸" if opt['is_atm'] else "  "
                 
                 ce_ltp = f"{opt['ce_ltp']:6.1f}" if opt['ce_ltp'] > 0 else "  -   "
                 ce_oi = f"{opt['ce_oi']/1000:5.0f}K" if opt['ce_oi'] > 0 else "  -  "
-                ce_vol = f"{opt['ce_volume']/1000:5.0f}K" if opt['ce_volume'] > 0 else "  -  "
                 
                 pe_ltp = f"{opt['pe_ltp']:6.1f}" if opt['pe_ltp'] > 0 else "  -   "
                 pe_oi = f"{opt['pe_oi']/1000:5.0f}K" if opt['pe_oi'] > 0 else "  -  "
-                pe_vol = f"{opt['pe_volume']/1000:5.0f}K" if opt['pe_volume'] > 0 else "  -  "
                 
-                message += f"{atm}{opt['strike']:5.0f} {ce_ltp} {ce_oi} {ce_vol}  {pe_ltp} {pe_oi} {pe_vol}\n"
+                message += f"{atm}{opt['strike']:5.0f} {ce_ltp} {ce_oi}  {pe_ltp} {pe_oi}\n"
             
             message += "```"
             
@@ -318,166 +334,90 @@ class NiftyDhanBot:
                 text=message,
                 parse_mode='Markdown'
             )
-            logger.info("✅ Option chain sent")
             
         except Exception as e:
             logger.error(f"Error sending OC: {e}")
     
-    async def send_greeks_message(self, option_data):
-        """Greeks telegram message"""
+    async def send_chart(self, name, historical_data):
+        """Send historical chart as PNG"""
         try:
-            atm_opt = next((o for o in option_data['options'] if o['is_atm']), None)
-            if not atm_opt:
-                return
+            chart = self.generate_chart(historical_data, f"{name} - Last 5 Days")
             
-            message = f"🎲 *GREEKS - ATM {atm_opt['strike']:.0f}*\n\n"
-            message += "```\n"
-            message += "         CALL         PUT\n"
-            message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            message += f"Delta:  {atm_opt['ce_delta']:7.4f}   {atm_opt['pe_delta']:7.4f}\n"
-            message += f"Theta:  {atm_opt['ce_theta']:7.2f}   {atm_opt['pe_theta']:7.2f}\n"
-            message += f"Gamma:  {atm_opt['ce_gamma']:7.5f}   {atm_opt['pe_gamma']:7.5f}\n"
-            message += f"Vega:   {atm_opt['ce_vega']:7.2f}   {atm_opt['pe_vega']:7.2f}\n"
-            message += f"IV:     {atm_opt['ce_iv']:6.2f}%   {atm_opt['pe_iv']:6.2f}%\n"
-            message += "```"
-            
-            await self.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=message,
-                parse_mode='Markdown'
-            )
-            logger.info("✅ Greeks sent")
+            if chart:
+                await self.bot.send_photo(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    photo=chart,
+                    caption=f"📈 {name} - Historical Chart (5 Days)"
+                )
+                logger.info(f"Chart sent for {name}")
             
         except Exception as e:
-            logger.error(f"Error Greeks: {e}")
-    
-    async def send_historical_message(self, hist_data):
-        """Historical data telegram message"""
-        try:
-            if not hist_data:
-                return
-            
-            message = f"📈 *HISTORICAL DATA (Last {len(hist_data)} Days)*\n\n"
-            message += "```\n"
-            message += "Date         Open     High      Low    Close     Vol\n"
-            message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            
-            for day in hist_data:
-                date = day['date']
-                message += f"{date} {day['open']:7.2f} {day['high']:7.2f} "
-                message += f"{day['low']:7.2f} {day['close']:7.2f} "
-                message += f"{day['volume']/1000000:5.1f}M\n"
-            
-            message += "```"
-            
-            await self.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=message,
-                parse_mode='Markdown'
-            )
-            logger.info("✅ Historical sent")
-            
-        except Exception as e:
-            logger.error(f"Error historical: {e}")
-    
-    async def send_nifty_ltp(self, data):
-        """LTP telegram message"""
-        try:
-            emoji = "🟢" if data['change'] >= 0 else "🔴"
-            sign = "+" if data['change'] >= 0 else ""
-            
-            msg = f"📊 *NIFTY 50* (Live)\n"
-            msg += f"💰 {data['ltp']:,.2f} {emoji} {sign}{data['change']:,.2f} ({sign}{data['change_pct']:.2f}%)"
-            
-            await self.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=msg,
-                parse_mode='Markdown'
-            )
-            
-        except Exception as e:
-            logger.error(f"Error LTP: {e}")
-    
-    async def option_chain_task(self):
-        """Background task for option chain updates"""
-        while self.running:
-            try:
-                await asyncio.sleep(300)  # Every 5 minutes
-                
-                oc = self.get_option_chain_with_greeks()
-                if oc:
-                    await self.send_option_chain_message(oc)
-                    await asyncio.sleep(2)
-                    await self.send_greeks_message(oc)
-                    
-            except Exception as e:
-                logger.error(f"Option chain task error: {e}")
+            logger.error(f"Error sending chart: {e}")
     
     async def run(self):
-        """Main async loop"""
-        logger.info("🚀 Dhan Bot started!")
+        """Main loop"""
+        logger.info("Multi-Stock Bot started")
         
         await self.send_startup_message()
         
-        # Initial setup
-        self.get_nearest_expiry()
+        iteration = 0
         
-        # Historical data
-        await asyncio.sleep(2)
-        hist = self.get_historical_data(5)
-        if hist:
-            await self.send_historical_message(hist)
-        
-        # Start option chain background task
-        asyncio.create_task(self.option_chain_task())
-        
-        # Start WebSocket in separate thread
-        ws_thread = threading.Thread(target=self.websocket_worker, daemon=True)
-        ws_thread.start()
-        
-        logger.info("✅ WebSocket thread started")
-        
-        # Main loop - process data from queue
         while self.running:
             try:
-                # Check queue for WebSocket data (non-blocking)
-                try:
-                    response = self.data_queue.get(timeout=1)
-                    
-                    parsed = self.parse_market_feed(response)
-                    
-                    if parsed:
-                        self.last_ltp_data = parsed
-                        
-                        # Send telegram message at intervals
-                        current_time = time.time()
-                        if current_time - self.last_message_time >= self.message_interval:
-                            await self.send_nifty_ltp(parsed)
-                            self.last_message_time = current_time
-                            
-                except queue.Empty:
-                    pass  # No data in queue, continue
+                # Live data every minute
+                live_data = self.get_live_data_batch()
+                if live_data:
+                    await self.send_live_summary(live_data)
                 
-                await asyncio.sleep(0.1)
+                # Option chains every 5 minutes
+                if iteration % 5 == 0:
+                    for idx_id in WATCHLIST.get('IDX_I', []):
+                        oc = self.get_option_chain(idx_id)
+                        if oc:
+                            name = "Nifty 50" if idx_id == "13" else "Bank Nifty"
+                            await self.send_option_chain_message(name, oc)
+                            await asyncio.sleep(2)
+                
+                # Historical charts every 30 minutes
+                if iteration % 30 == 0 and iteration > 0:
+                    logger.info("Fetching historical data for charts...")
+                    
+                    # Indices
+                    for idx_id in WATCHLIST.get('IDX_I', []):
+                        hist_data = self.get_historical_batch([idx_id], "IDX_I", 5)
+                        if idx_id in hist_data:
+                            name = "Nifty 50" if idx_id == "13" else "Bank Nifty"
+                            await self.send_chart(name, hist_data[idx_id])
+                            await asyncio.sleep(1)
+                    
+                    # Top 5 stocks
+                    stock_ids = WATCHLIST.get('NSE_EQ', [])[:5]
+                    hist_data = self.get_historical_batch(stock_ids, "NSE_EQ", 5)
+                    for sec_id, data in hist_data.items():
+                        await self.send_chart(f"Stock {sec_id}", data)
+                        await asyncio.sleep(1)
+                
+                iteration += 1
+                await asyncio.sleep(60)  # 1 minute
                 
             except KeyboardInterrupt:
-                logger.info("⛔ Shutting down...")
                 self.running = False
                 break
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(60)
     
     async def send_startup_message(self):
         """Startup message"""
         try:
-            msg = "🤖 *Nifty Dhan Bot v3.2*\n\n"
-            msg += "✅ Real-time via Dhan WebSocket\n"
-            msg += "✅ Option Chain - Every 5 min\n"
-            msg += "✅ Greeks (Δ Θ Γ V)\n"
-            msg += "✅ Historical Data (5 days)\n\n"
-            msg += "⚡ Thread-safe sync+async\n"
-            msg += "🚂 Railway.app"
+            total = sum(len(v) for v in WATCHLIST.values())
+            msg = f"🤖 *Multi-Stock Dhan Bot*\n\n"
+            msg += f"📊 Tracking {total} instruments\n"
+            msg += f"✅ Live data - Every 1 min\n"
+            msg += f"✅ Option chains - Every 5 min\n"
+            msg += f"✅ Historical charts - Every 30 min\n\n"
+            msg += f"⚡ Batch processing enabled\n"
+            msg += f"🚂 Railway.app"
             
             await self.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
@@ -491,10 +431,10 @@ class NiftyDhanBot:
 if __name__ == "__main__":
     try:
         if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN]):
-            logger.error("❌ Missing env vars!")
+            logger.error("Missing env vars")
             exit(1)
         
-        bot = NiftyDhanBot()
+        bot = MultiStockDhanBot()
         asyncio.run(bot.run())
     except Exception as e:
         logger.error(f"Fatal: {e}")
