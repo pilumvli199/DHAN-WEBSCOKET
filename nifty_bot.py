@@ -4,9 +4,8 @@ from telegram import Bot
 import requests
 from datetime import datetime, timedelta
 import logging
-import json
-import websockets
-from typing import Dict, List
+from dhanhq import DhanContext, MarketFeed, dhanhq
+import threading
 
 # Logging setup
 logging.basicConfig(
@@ -25,167 +24,91 @@ DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 
 # Dhan API URLs
 DHAN_API_BASE = "https://api.dhan.co"
-DHAN_OHLC_URL = f"{DHAN_API_BASE}/v2/marketfeed/ohlc"
-DHAN_OPTION_CHAIN_URL = f"{DHAN_API_BASE}/v2/optionchain"
-DHAN_EXPIRY_LIST_URL = f"{DHAN_API_BASE}/v2/optionchain/expirylist"
-DHAN_HISTORICAL_URL = f"{DHAN_API_BASE}/v2/charts/historical"
-
-# Dhan WebSocket URL
-DHAN_WS_URL = "wss://api-feed.dhan.co"
 
 # Nifty 50 Config
-NIFTY_50_SECURITY_ID = 13
+NIFTY_50_SECURITY_ID = "13"
 NIFTY_SEGMENT = "IDX_I"
 
-# WebSocket message types
-WS_CONNECT = 2
-WS_SUBSCRIBE = 15
-WS_UNSUBSCRIBE = 16
-
 # ========================
-# WEBSOCKET BOT CODE
+# PROPER WEBSOCKET BOT
 # ========================
 
 class NiftyWebSocketBot:
     def __init__(self):
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.running = True
-        self.headers = {
-            'access-token': DHAN_ACCESS_TOKEN,
-            'client-id': DHAN_CLIENT_ID,
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-        }
+        
+        # Dhan Context Setup
+        self.dhan_context = DhanContext(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+        self.dhan = dhanhq(self.dhan_context)
+        
+        # Market Feed Setup
+        instruments = [
+            (MarketFeed.IDX, NIFTY_50_SECURITY_ID, MarketFeed.Full)  # Full packet for Nifty
+        ]
+        self.market_feed = MarketFeed(self.dhan_context, instruments, "v2")
+        
         self.current_expiry = None
-        self.ws = None
         self.last_ltp_data = None
         self.last_message_time = 0
-        self.message_interval = 60  # Send telegram message every 60 seconds
-        logger.info("WebSocket Bot initialized successfully")
+        self.message_interval = 60  # Telegram message every 60 seconds
+        
+        logger.info("✅ Dhan WebSocket Bot initialized")
     
     def get_nearest_expiry(self):
-        """Nearest expiry date मिळवतो"""
+        """Nearest expiry date"""
         try:
-            payload = {
-                "UnderlyingScrip": NIFTY_50_SECURITY_ID,
-                "UnderlyingSeg": NIFTY_SEGMENT
-            }
-            
-            response = requests.post(
-                DHAN_EXPIRY_LIST_URL,
-                json=payload,
-                headers=self.headers,
-                timeout=10
+            response = self.dhan.expiry_list(
+                under_security_id=int(NIFTY_50_SECURITY_ID),
+                under_exchange_segment=NIFTY_SEGMENT
             )
             
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('status') == 'success' and 'data' in data:
-                    expiries = data['data']
-                    if expiries:
-                        self.current_expiry = expiries[0]
-                        logger.info(f"Nearest expiry: {self.current_expiry}")
-                        return self.current_expiry
+            if response.get('status') == 'success' and 'data' in response:
+                expiries = response['data']
+                if expiries:
+                    self.current_expiry = expiries[0]
+                    logger.info(f"📅 Nearest expiry: {self.current_expiry}")
+                    return self.current_expiry
             
             return None
         except Exception as e:
             logger.error(f"Error getting expiry: {e}")
             return None
     
-    def get_nifty_ltp(self):
-        """REST API - Nifty 50 LTP (fallback)"""
-        try:
-            payload = {
-                "IDX_I": [NIFTY_50_SECURITY_ID]
-            }
-            
-            response = requests.post(
-                DHAN_OHLC_URL,
-                json=payload,
-                headers=self.headers,
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                if data.get('status') == 'success' and 'data' in data:
-                    idx_data = data['data'].get('IDX_I', {})
-                    nifty_data = idx_data.get(str(NIFTY_50_SECURITY_ID), {})
-                    
-                    if nifty_data and 'last_price' in nifty_data:
-                        ltp = nifty_data['last_price']
-                        ohlc = nifty_data.get('ohlc', {})
-                        
-                        result = {
-                            'ltp': ltp,
-                            'open': ohlc.get('open', 0),
-                            'high': ohlc.get('high', 0),
-                            'low': ohlc.get('low', 0),
-                            'close': ohlc.get('close', 0)
-                        }
-                        
-                        if result['close'] > 0:
-                            result['change'] = ltp - result['close']
-                            result['change_pct'] = (result['change'] / result['close']) * 100
-                        else:
-                            result['change'] = 0
-                            result['change_pct'] = 0
-                        
-                        return result
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error getting LTP: {e}")
-            return None
-    
     def get_historical_data(self, days=5):
-        """Historical data"""
+        """Historical data using Dhan API"""
         try:
             to_date = datetime.now().strftime("%Y-%m-%d")
-            from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+            from_date = (datetime.now() - timedelta(days=days+2)).strftime("%Y-%m-%d")
             
-            payload = {
-                "securityId": str(NIFTY_50_SECURITY_ID),
-                "exchangeSegment": NIFTY_SEGMENT,
-                "instrument": "INDEX",
-                "expiryCode": 0,
-                "oi": False,
-                "fromDate": from_date,
-                "toDate": to_date
-            }
-            
-            response = requests.post(
-                DHAN_HISTORICAL_URL,
-                json=payload,
-                headers=self.headers,
-                timeout=15
+            response = self.dhan.historical_daily_data(
+                security_id=NIFTY_50_SECURITY_ID,
+                exchange_segment=NIFTY_SEGMENT,
+                instrument_type="INDEX",
+                from_date=from_date,
+                to_date=to_date
             )
             
-            if response.status_code == 200:
-                data = response.json()
+            if 'open' in response and 'close' in response:
+                timestamps = response.get('timestamp', [])
+                opens = response.get('open', [])
+                highs = response.get('high', [])
+                lows = response.get('low', [])
+                closes = response.get('close', [])
+                volumes = response.get('volume', [])
                 
-                if 'open' in data and 'close' in data:
-                    timestamps = data.get('timestamp', [])
-                    opens = data.get('open', [])
-                    highs = data.get('high', [])
-                    lows = data.get('low', [])
-                    closes = data.get('close', [])
-                    volumes = data.get('volume', [])
-                    
-                    parsed_data = []
-                    for i in range(len(timestamps)):
-                        parsed_data.append({
-                            'date': datetime.fromtimestamp(timestamps[i]).strftime('%Y-%m-%d'),
-                            'open': opens[i] if i < len(opens) else 0,
-                            'high': highs[i] if i < len(highs) else 0,
-                            'low': lows[i] if i < len(lows) else 0,
-                            'close': closes[i] if i < len(closes) else 0,
-                            'volume': volumes[i] if i < len(volumes) else 0
-                        })
-                    
-                    return parsed_data[-5:]  # Last 5 days
+                parsed_data = []
+                for i in range(len(timestamps)):
+                    parsed_data.append({
+                        'date': datetime.fromtimestamp(timestamps[i]).strftime('%Y-%m-%d'),
+                        'open': opens[i] if i < len(opens) else 0,
+                        'high': highs[i] if i < len(highs) else 0,
+                        'low': lows[i] if i < len(lows) else 0,
+                        'close': closes[i] if i < len(closes) else 0,
+                        'volume': volumes[i] if i < len(volumes) else 0
+                    })
+                
+                return parsed_data[-5:]  # Last 5 days
             
             return None
             
@@ -194,7 +117,7 @@ class NiftyWebSocketBot:
             return None
     
     def get_option_chain_with_greeks(self):
-        """Option Chain with Greeks & Volume"""
+        """Option Chain using Dhan API"""
         try:
             if not self.current_expiry:
                 self.get_nearest_expiry()
@@ -202,75 +125,65 @@ class NiftyWebSocketBot:
             if not self.current_expiry:
                 return None
             
-            payload = {
-                "UnderlyingScrip": NIFTY_50_SECURITY_ID,
-                "UnderlyingSeg": NIFTY_SEGMENT,
-                "Expiry": self.current_expiry
-            }
-            
-            response = requests.post(
-                DHAN_OPTION_CHAIN_URL,
-                json=payload,
-                headers=self.headers,
-                timeout=15
+            response = self.dhan.option_chain(
+                under_security_id=int(NIFTY_50_SECURITY_ID),
+                under_exchange_segment=NIFTY_SEGMENT,
+                expiry=self.current_expiry
             )
             
-            if response.status_code == 200:
-                data = response.json()
+            if response.get('status') == 'success' and 'data' in response:
+                spot_price = response['data'].get('last_price', 0)
+                oc_data = response['data'].get('oc', {})
                 
-                if data.get('status') == 'success' and 'data' in data:
-                    spot_price = data['data'].get('last_price', 0)
-                    oc_data = data['data'].get('oc', {})
+                if not oc_data:
+                    return None
+                
+                strikes = sorted([float(s) for s in oc_data.keys()])
+                atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
+                atm_index = strikes.index(atm_strike)
+                
+                # 5 strikes around ATM
+                start_idx = max(0, atm_index - 5)
+                end_idx = min(len(strikes), atm_index + 6)
+                selected_strikes = strikes[start_idx:end_idx]
+                
+                option_data = []
+                for strike in selected_strikes:
+                    strike_key = f"{strike:.6f}"
+                    strike_data = oc_data.get(strike_key, {})
                     
-                    if not oc_data:
-                        return None
+                    ce_data = strike_data.get('ce', {})
+                    pe_data = strike_data.get('pe', {})
+                    ce_greeks = ce_data.get('greeks', {})
+                    pe_greeks = pe_data.get('greeks', {})
                     
-                    strikes = sorted([float(s) for s in oc_data.keys()])
-                    atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
-                    atm_index = strikes.index(atm_strike)
-                    
-                    # 5 strikes around ATM
-                    start_idx = max(0, atm_index - 5)
-                    end_idx = min(len(strikes), atm_index + 6)
-                    selected_strikes = strikes[start_idx:end_idx]
-                    
-                    option_data = []
-                    for strike in selected_strikes:
-                        strike_key = f"{strike:.6f}"
-                        strike_data = oc_data.get(strike_key, {})
-                        
-                        ce_data = strike_data.get('ce', {})
-                        pe_data = strike_data.get('pe', {})
-                        ce_greeks = ce_data.get('greeks', {})
-                        pe_greeks = pe_data.get('greeks', {})
-                        
-                        option_data.append({
-                            'strike': strike,
-                            'ce_ltp': ce_data.get('last_price', 0),
-                            'ce_oi': ce_data.get('oi', 0),
-                            'ce_volume': ce_data.get('volume', 0),
-                            'ce_iv': ce_data.get('implied_volatility', 0),
-                            'ce_delta': ce_greeks.get('delta', 0),
-                            'ce_theta': ce_greeks.get('theta', 0),
-                            'ce_gamma': ce_greeks.get('gamma', 0),
-                            'ce_vega': ce_greeks.get('vega', 0),
-                            'pe_ltp': pe_data.get('last_price', 0),
-                            'pe_oi': pe_data.get('oi', 0),
-                            'pe_volume': pe_data.get('volume', 0),
-                            'pe_iv': pe_data.get('implied_volatility', 0),
-                            'pe_delta': pe_greeks.get('delta', 0),
-                            'pe_theta': pe_greeks.get('theta', 0),
-                            'pe_gamma': pe_greeks.get('gamma', 0),
-                            'pe_vega': pe_greeks.get('vega', 0),
-                            'is_atm': (strike == atm_strike)
-                        })
-                    
-                    return {
-                        'spot': spot_price,
-                        'atm': atm_strike,
-                        'expiry': self.current_expiry,
-                        'options': option_data
-                    }
+                    option_data.append({
+                        'strike': strike,
+                        'ce_ltp': ce_data.get('last_price', 0),
+                        'ce_oi': ce_data.get('oi', 0),
+                        'ce_volume': ce_data.get('volume', 0),
+                        'ce_iv': ce_data.get('implied_volatility', 0),
+                        'ce_delta': ce_greeks.get('delta', 0),
+                        'ce_theta': ce_greeks.get('theta', 0),
+                        'ce_gamma': ce_greeks.get('gamma', 0),
+                        'ce_vega': ce_greeks.get('vega', 0),
+                        'pe_ltp': pe_data.get('last_price', 0),
+                        'pe_oi': pe_data.get('oi', 0),
+                        'pe_volume': pe_data.get('volume', 0),
+                        'pe_iv': pe_data.get('implied_volatility', 0),
+                        'pe_delta': pe_greeks.get('delta', 0),
+                        'pe_theta': pe_greeks.get('theta', 0),
+                        'pe_gamma': pe_greeks.get('gamma', 0),
+                        'pe_vega': pe_greeks.get('vega', 0),
+                        'is_atm': (strike == atm_strike)
+                    })
+                
+                return {
+                    'spot': spot_price,
+                    'atm': atm_strike,
+                    'expiry': self.current_expiry,
+                    'options': option_data
+                }
             
             return None
             
@@ -278,158 +191,42 @@ class NiftyWebSocketBot:
             logger.error(f"Error option chain: {e}")
             return None
     
-    async def connect_websocket(self):
-        """WebSocket connection बनवतो"""
+    def parse_market_feed(self, data):
+        """Parse Dhan market feed data"""
         try:
-            # Dhan WebSocket needs headers
-            headers = {
-                "Authorization": f"{DHAN_ACCESS_TOKEN}",
-                "client-id": DHAN_CLIENT_ID
+            if not data or not isinstance(data, dict):
+                return None
+            
+            # Dhan Full packet structure
+            ltp = data.get('LTP', data.get('last_price', 0))
+            open_price = data.get('open', 0)
+            high = data.get('high', 0)
+            low = data.get('low', 0)
+            close = data.get('close', data.get('prev_close', 0))
+            
+            if ltp == 0:
+                return None
+            
+            result = {
+                'ltp': float(ltp),
+                'open': float(open_price),
+                'high': float(high),
+                'low': float(low),
+                'close': float(close)
             }
             
-            logger.info(f"🔌 Connecting to {DHAN_WS_URL}")
-            self.ws = await websockets.connect(
-                DHAN_WS_URL,
-                extra_headers=headers,
-                ping_interval=20,
-                ping_timeout=10
-            )
-            logger.info("✅ WebSocket connected")
+            if result['close'] > 0:
+                result['change'] = result['ltp'] - result['close']
+                result['change_pct'] = (result['change'] / result['close']) * 100
+            else:
+                result['change'] = 0
+                result['change_pct'] = 0
             
-            # Wait for connection confirmation
-            await asyncio.sleep(1)
-            
-            # Subscribe to Nifty 50 Index
-            # Dhan format: {"RequestCode":15,"InstrumentType":1,"SecurityId":"13"}
-            subscribe_msg = {
-                "RequestCode": 15,
-                "InstrumentType": 1,
-                "SecurityId": str(NIFTY_50_SECURITY_ID)
-            }
-            
-            await self.ws.send(json.dumps(subscribe_msg))
-            logger.info(f"📊 Subscribed to Nifty 50 (ID: {NIFTY_50_SECURITY_ID})")
-            logger.info(f"📤 Sent: {subscribe_msg}")
-            
-            return True
+            return result
             
         except Exception as e:
-            logger.error(f"❌ WebSocket connection error: {e}")
-            logger.exception("Full traceback:")
-            return False
-    
-    def parse_websocket_message(self, data: Dict) -> Dict:
-        """WebSocket message parse करतो"""
-        try:
-            logger.info(f"🔍 Parsing data keys: {data.keys() if isinstance(data, dict) else type(data)}")
-            
-            # Dhan WebSocket format variations
-            if isinstance(data, dict):
-                # Try different field names
-                ltp = (data.get('LTP') or 
-                       data.get('ltp') or 
-                       data.get('last_price') or 
-                       data.get('lastPrice') or 
-                       data.get('close') or 0)
-                
-                open_price = (data.get('open') or 
-                             data.get('Open') or 
-                             data.get('openPrice') or 0)
-                
-                high = (data.get('high') or 
-                       data.get('High') or 
-                       data.get('highPrice') or 0)
-                
-                low = (data.get('low') or 
-                      data.get('Low') or 
-                      data.get('lowPrice') or 0)
-                
-                close = (data.get('close') or 
-                        data.get('Close') or 
-                        data.get('prev_close') or 
-                        data.get('prevClose') or 0)
-                
-                # If no LTP found, return None
-                if ltp == 0:
-                    logger.warning(f"⚠️ No LTP found in data: {list(data.keys())}")
-                    return None
-                
-                result = {
-                    'ltp': float(ltp),
-                    'open': float(open_price),
-                    'high': float(high),
-                    'low': float(low),
-                    'close': float(close)
-                }
-                
-                if result['close'] > 0:
-                    result['change'] = result['ltp'] - result['close']
-                    result['change_pct'] = (result['change'] / result['close']) * 100
-                else:
-                    result['change'] = 0
-                    result['change_pct'] = 0
-                
-                logger.info(f"✅ Parsed LTP: {result['ltp']:.2f}")
-                return result
-            
+            logger.error(f"Error parsing feed: {e}")
             return None
-            
-        except Exception as e:
-            logger.error(f"❌ Error parsing WS message: {e}")
-            logger.exception("Parse error details:")
-            return None
-    
-    async def handle_websocket_messages(self):
-        """WebSocket messages handle करतो"""
-        try:
-            async for message in self.ws:
-                try:
-                    logger.info(f"📥 Raw WS Message: {message[:200]}")  # First 200 chars
-                    
-                    data = json.loads(message)
-                    logger.info(f"📦 Parsed Data: {data}")
-                    
-                    # Dhan WebSocket response format check
-                    # Format 1: {"type":"ticker","data":{...}}
-                    # Format 2: Direct data object
-                    
-                    actual_data = data
-                    if isinstance(data, dict):
-                        if 'data' in data:
-                            actual_data = data['data']
-                        elif 'type' in data and data['type'] == 'ticker':
-                            actual_data = data.get('data', data)
-                    
-                    # Parse the message
-                    parsed = self.parse_websocket_message(actual_data)
-                    
-                    if parsed:
-                        self.last_ltp_data = parsed
-                        
-                        # Send telegram message at intervals
-                        current_time = datetime.now().timestamp()
-                        if current_time - self.last_message_time >= self.message_interval:
-                            await self.send_nifty_ltp(parsed)
-                            self.last_message_time = current_time
-                            logger.info(f"📊 LTP Updated: {parsed['ltp']:.2f}")
-                    else:
-                        logger.warning(f"⚠️ Could not parse: {actual_data}")
-                
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Invalid JSON: {message[:100]} | Error: {e}")
-                except Exception as e:
-                    logger.error(f"Error processing message: {e}")
-                    logger.exception("Full error:")
-                    
-        except websockets.exceptions.ConnectionClosed as e:
-            logger.warning(f"⚠️ WebSocket connection closed: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"WebSocket handler error: {e}")
-            logger.exception("Full traceback:")
-            return False
-        
-        return True
     
     async def send_option_chain_message(self, option_data):
         """Option Chain telegram message"""
@@ -531,7 +328,7 @@ class NiftyWebSocketBot:
             emoji = "🟢" if data['change'] >= 0 else "🔴"
             sign = "+" if data['change'] >= 0 else ""
             
-            msg = f"📊 *NIFTY 50* (Live)\n"
+            msg = f"📊 *NIFTY 50* (WebSocket)\n"
             msg += f"💰 {data['ltp']:,.2f} {emoji} {sign}{data['change']:,.2f} ({sign}{data['change_pct']:.2f}%)"
             
             await self.bot.send_message(
@@ -558,9 +355,17 @@ class NiftyWebSocketBot:
             except Exception as e:
                 logger.error(f"Option chain task error: {e}")
     
+    def websocket_thread(self):
+        """WebSocket in separate thread"""
+        try:
+            logger.info("🔌 Starting Dhan WebSocket...")
+            self.market_feed.run_forever()
+        except Exception as e:
+            logger.error(f"WebSocket error: {e}")
+    
     async def run(self):
-        """Main WebSocket loop with REST API fallback"""
-        logger.info("🚀 WebSocket Bot started!")
+        """Main loop"""
+        logger.info("🚀 Dhan WebSocket Bot started!")
         
         await self.send_startup_message()
         
@@ -576,35 +381,33 @@ class NiftyWebSocketBot:
         # Start option chain background task
         asyncio.create_task(self.option_chain_task())
         
-        # Try WebSocket first
-        ws_failed_count = 0
-        use_rest_fallback = False
+        # Start WebSocket in separate thread
+        ws_thread = threading.Thread(target=self.websocket_thread, daemon=True)
+        ws_thread.start()
         
+        logger.info("✅ WebSocket thread started")
+        
+        # Main loop - process WebSocket data
         while self.running:
             try:
-                if not use_rest_fallback and ws_failed_count < 3:
-                    # Try WebSocket
-                    logger.info("🔌 Attempting WebSocket connection...")
-                    if await self.connect_websocket():
-                        ws_failed_count = 0
-                        # Handle messages
-                        success = await self.handle_websocket_messages()
-                        if not success:
-                            ws_failed_count += 1
-                    else:
-                        ws_failed_count += 1
+                # Get data from WebSocket
+                response = self.market_feed.get_data()
+                
+                if response:
+                    logger.info(f"📡 WebSocket data received")
                     
-                    if ws_failed_count >= 3:
-                        logger.warning("⚠️ WebSocket failed 3 times, switching to REST API fallback")
-                        use_rest_fallback = True
+                    parsed = self.parse_market_feed(response)
+                    
+                    if parsed:
+                        self.last_ltp_data = parsed
+                        
+                        # Send telegram message at intervals
+                        current_time = datetime.now().timestamp()
+                        if current_time - self.last_message_time >= self.message_interval:
+                            await self.send_nifty_ltp(parsed)
+                            self.last_message_time = current_time
                 
-                if use_rest_fallback:
-                    # REST API fallback
-                    logger.info("🔄 Using REST API mode...")
-                    await self.rest_api_loop()
-                
-                logger.warning("⚠️ Reconnecting in 5 seconds...")
-                await asyncio.sleep(5)
+                await asyncio.sleep(1)  # Check every second
                 
             except KeyboardInterrupt:
                 logger.info("⛔ Shutting down...")
@@ -612,39 +415,20 @@ class NiftyWebSocketBot:
                 break
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
-                logger.exception("Error details:")
                 await asyncio.sleep(5)
         
         # Cleanup
-        if self.ws:
-            await self.ws.close()
-    
-    async def rest_api_loop(self):
-        """REST API fallback loop"""
-        logger.info("📡 REST API mode activated")
-        for i in range(60):  # Run for 60 iterations then retry WebSocket
-            try:
-                nifty = self.get_nifty_ltp()
-                if nifty:
-                    await self.send_nifty_ltp(nifty)
-                    self.last_ltp_data = nifty
-                
-                await asyncio.sleep(60)
-            except Exception as e:
-                logger.error(f"REST API error: {e}")
-                break
-        
-        logger.info("🔄 Retrying WebSocket...")
+        self.market_feed.disconnect()
     
     async def send_startup_message(self):
         """Startup message"""
         try:
-            msg = "🤖 *Nifty WebSocket Bot v3*\n\n"
-            msg += "✅ Real-time LTP via WebSocket\n"
+            msg = "🤖 *Nifty WebSocket Bot v3.1*\n\n"
+            msg += "✅ Real-time via Dhan WebSocket\n"
             msg += "✅ Option Chain - Every 5 min\n"
             msg += "✅ Greeks (Δ Θ Γ V)\n"
             msg += "✅ Historical Data (5 days)\n\n"
-            msg += "⚡ WebSocket-powered\n"
+            msg += "⚡ Official Dhan Library\n"
             msg += "🚂 Railway.app"
             
             await self.bot.send_message(
