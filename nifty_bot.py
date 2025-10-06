@@ -1,11 +1,12 @@
 import asyncio
 import os
 from telegram import Bot
-import requests
 from datetime import datetime, timedelta
 import logging
 from dhanhq import DhanContext, MarketFeed, dhanhq
 import threading
+import time
+import queue
 
 # Logging setup
 logging.basicConfig(
@@ -22,18 +23,15 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 
-# Dhan API URLs
-DHAN_API_BASE = "https://api.dhan.co"
-
 # Nifty 50 Config
 NIFTY_50_SECURITY_ID = "13"
 NIFTY_SEGMENT = "IDX_I"
 
 # ========================
-# PROPER WEBSOCKET BOT
+# SYNC + ASYNC BOT
 # ========================
 
-class NiftyWebSocketBot:
+class NiftyDhanBot:
     def __init__(self):
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.running = True
@@ -42,25 +40,21 @@ class NiftyWebSocketBot:
         self.dhan_context = DhanContext(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
         self.dhan = dhanhq(self.dhan_context)
         
-        # Market Feed Setup - v2 format
+        # Market Feed Setup
         instruments = [
             (MarketFeed.IDX, NIFTY_50_SECURITY_ID, MarketFeed.Full)
         ]
-        
-        # Try v2 first, fallback to v1 if needed
-        try:
-            self.market_feed = MarketFeed(self.dhan_context, instruments, "v2")
-            logger.info("✅ Using Dhan WebSocket v2")
-        except:
-            self.market_feed = MarketFeed(self.dhan_context, instruments)
-            logger.info("✅ Using Dhan WebSocket v1")
+        self.market_feed = MarketFeed(self.dhan_context, instruments, "v2")
         
         self.current_expiry = None
         self.last_ltp_data = None
         self.last_message_time = 0
-        self.message_interval = 60  # Telegram message every 60 seconds
+        self.message_interval = 60
         
-        logger.info("✅ Dhan WebSocket Bot initialized")
+        # Queue for WebSocket data
+        self.data_queue = queue.Queue()
+        
+        logger.info("✅ Dhan Bot initialized")
     
     def get_nearest_expiry(self):
         """Nearest expiry date"""
@@ -70,8 +64,8 @@ class NiftyWebSocketBot:
                 under_exchange_segment=NIFTY_SEGMENT
             )
             
-            if response.get('status') == 'success' and 'data' in response:
-                expiries = response['data']
+            if isinstance(response, dict) and response.get('status') == 'success':
+                expiries = response.get('data', [])
                 if expiries:
                     self.current_expiry = expiries[0]
                     logger.info(f"📅 Nearest expiry: {self.current_expiry}")
@@ -115,7 +109,7 @@ class NiftyWebSocketBot:
                         'volume': volumes[i] if i < len(volumes) else 0
                     })
                 
-                return parsed_data[-5:]  # Last 5 days
+                return parsed_data[-5:]
             
             return None
             
@@ -149,7 +143,6 @@ class NiftyWebSocketBot:
                 atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
                 atm_index = strikes.index(atm_strike)
                 
-                # 5 strikes around ATM
                 start_idx = max(0, atm_index - 5)
                 end_idx = min(len(strikes), atm_index + 6)
                 selected_strikes = strikes[start_idx:end_idx]
@@ -204,7 +197,6 @@ class NiftyWebSocketBot:
             if not data or not isinstance(data, dict):
                 return None
             
-            # Dhan Full packet structure
             ltp = data.get('LTP', data.get('last_price', 0))
             open_price = data.get('open', 0)
             high = data.get('high', 0)
@@ -234,6 +226,35 @@ class NiftyWebSocketBot:
         except Exception as e:
             logger.error(f"Error parsing feed: {e}")
             return None
+    
+    def websocket_worker(self):
+        """WebSocket worker thread (sync)"""
+        try:
+            logger.info("🔌 Starting Dhan WebSocket...")
+            
+            while self.running:
+                try:
+                    # Get data from WebSocket (blocking call)
+                    response = self.market_feed.get_data()
+                    
+                    if response:
+                        # Put data in queue for async processing
+                        self.data_queue.put(response)
+                        logger.debug("📡 Data received")
+                    
+                    time.sleep(0.1)  # Small delay
+                    
+                except Exception as e:
+                    logger.error(f"WebSocket worker error: {e}")
+                    time.sleep(5)
+                    
+        except Exception as e:
+            logger.error(f"Fatal WebSocket error: {e}")
+        finally:
+            try:
+                self.market_feed.disconnect()
+            except:
+                pass
     
     async def send_option_chain_message(self, option_data):
         """Option Chain telegram message"""
@@ -335,7 +356,7 @@ class NiftyWebSocketBot:
             emoji = "🟢" if data['change'] >= 0 else "🔴"
             sign = "+" if data['change'] >= 0 else ""
             
-            msg = f"📊 *NIFTY 50* (WebSocket)\n"
+            msg = f"📊 *NIFTY 50* (Live)\n"
             msg += f"💰 {data['ltp']:,.2f} {emoji} {sign}{data['change']:,.2f} ({sign}{data['change_pct']:.2f}%)"
             
             await self.bot.send_message(
@@ -362,17 +383,9 @@ class NiftyWebSocketBot:
             except Exception as e:
                 logger.error(f"Option chain task error: {e}")
     
-    def websocket_thread(self):
-        """WebSocket in separate thread"""
-        try:
-            logger.info("🔌 Starting Dhan WebSocket...")
-            self.market_feed.run_forever()
-        except Exception as e:
-            logger.error(f"WebSocket error: {e}")
-    
     async def run(self):
-        """Main loop"""
-        logger.info("🚀 Dhan WebSocket Bot started!")
+        """Main async loop"""
+        logger.info("🚀 Dhan Bot started!")
         
         await self.send_startup_message()
         
@@ -389,19 +402,17 @@ class NiftyWebSocketBot:
         asyncio.create_task(self.option_chain_task())
         
         # Start WebSocket in separate thread
-        ws_thread = threading.Thread(target=self.websocket_thread, daemon=True)
+        ws_thread = threading.Thread(target=self.websocket_worker, daemon=True)
         ws_thread.start()
         
         logger.info("✅ WebSocket thread started")
         
-        # Main loop - process WebSocket data
+        # Main loop - process data from queue
         while self.running:
             try:
-                # Get data from WebSocket
-                response = self.market_feed.get_data()
-                
-                if response:
-                    logger.info(f"📡 WebSocket data received")
+                # Check queue for WebSocket data (non-blocking)
+                try:
+                    response = self.data_queue.get(timeout=1)
                     
                     parsed = self.parse_market_feed(response)
                     
@@ -409,12 +420,15 @@ class NiftyWebSocketBot:
                         self.last_ltp_data = parsed
                         
                         # Send telegram message at intervals
-                        current_time = datetime.now().timestamp()
+                        current_time = time.time()
                         if current_time - self.last_message_time >= self.message_interval:
                             await self.send_nifty_ltp(parsed)
                             self.last_message_time = current_time
+                            
+                except queue.Empty:
+                    pass  # No data in queue, continue
                 
-                await asyncio.sleep(1)  # Check every second
+                await asyncio.sleep(0.1)
                 
             except KeyboardInterrupt:
                 logger.info("⛔ Shutting down...")
@@ -423,19 +437,16 @@ class NiftyWebSocketBot:
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
                 await asyncio.sleep(5)
-        
-        # Cleanup
-        self.market_feed.disconnect()
     
     async def send_startup_message(self):
         """Startup message"""
         try:
-            msg = "🤖 *Nifty WebSocket Bot v3.1*\n\n"
+            msg = "🤖 *Nifty Dhan Bot v3.2*\n\n"
             msg += "✅ Real-time via Dhan WebSocket\n"
             msg += "✅ Option Chain - Every 5 min\n"
             msg += "✅ Greeks (Δ Θ Γ V)\n"
             msg += "✅ Historical Data (5 days)\n\n"
-            msg += "⚡ Official Dhan Library\n"
+            msg += "⚡ Thread-safe sync+async\n"
             msg += "🚂 Railway.app"
             
             await self.bot.send_message(
@@ -453,7 +464,7 @@ if __name__ == "__main__":
             logger.error("❌ Missing env vars!")
             exit(1)
         
-        bot = NiftyWebSocketBot()
+        bot = NiftyDhanBot()
         asyncio.run(bot.run())
     except Exception as e:
         logger.error(f"Fatal: {e}")
