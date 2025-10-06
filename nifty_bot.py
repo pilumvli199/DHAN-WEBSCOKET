@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# updated_bot.py - Nifty + Sensex + multiple stocks LTP bot (Dhan API v2, Telegram)
-# Behaves mostly like your original; now fetches a list of equities + indices and posts a single consolidated message every minute.
+# updated_bot_safe_send.py - fixes Telegram entity parsing + 429 handling
 
 import asyncio
 import os
@@ -8,6 +7,8 @@ from telegram import Bot
 import requests
 from datetime import datetime
 import logging
+import time
+import math
 
 # -------------------------
 # Logging setup
@@ -26,16 +27,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 
-# Dhan API URLs (same as before)
 DHAN_API_BASE = "https://api.dhan.co"
-DHAN_LTP_URL = f"{DHAN_API_BASE}/v2/marketfeed/ltp"   # symbol-based LTP endpoint (best effort)
-DHAN_OHLC_URL = f"{DHAN_API_BASE}/v2/marketfeed/ohlc" # for index OHLC (used for NIFTY in fallback)
+DHAN_LTP_URL = f"{DHAN_API_BASE}/v2/marketfeed/ltp"
+DHAN_OHLC_URL = f"{DHAN_API_BASE}/v2/marketfeed/ohlc"
 
-# ========================
-# Instruments (user list)
-# Map display name -> exchange symbol (NSE symbol)
-# If your Dhan API needs numeric security IDs, add them to EXTRA_INDEX_IDS below.
-# ========================
+# Instruments (same as before)
 INSTRUMENTS = {
     "RELIANCE": "RELIANCE",
     "HDFC Bank": "HDFCBANK",
@@ -58,30 +54,62 @@ INSTRUMENTS = {
     "Power Grid": "POWERGRID",
     "ONGC": "ONGC",
     "Persistent Systems": "PERSISTENT",
-    "DRREDDY": "DRREDDY",
-    "M&M": "M&M",  # Many APIs use 'M&M' or 'M&M.NS' - keep it as M&M for now; adjust if needed
+    "DR Reddy's": "DRREDDY",
+    "M&M": "M&M",
     "Wipro": "WIPRO",
-    "Dmart": "AVENUE_SUPERMARTS",  # user wrote Dmart (AVENUE SUPERMARTS) -> try this symbol
+    "Dmart": "AVENUE_SUPERMARTS",
     "Trent Ltd": "TRENT",
-    "Poonawalla": "POONAWALLA",  # example symbol — verify with your broker if different
-    # Add more if needed
+    "Poonawalla": "POONAWALLA",
 }
 
-# Indices: Nifty 50 and Sensex (we'll try symbol-based fetch first, then fallback to OHLC index id)
-INDEX_SYMBOLS = {
-    "NIFTY 50": "NIFTY 50",   # many APIs accept an index symbol; fallback to numeric ID below
-    "SENSEX": "SENSEX"
-}
-
-# If Dhan requires numeric index IDs (like you used NIFTY security id = 13), place them here.
-# Keep blank or update to accurate IDs if you know them.
-EXTRA_INDEX_IDS = {
-    "NIFTY 50": 13,   # you used 13 earlier
-    # "SENSEX": <put_sensex_id_if_known>
-}
+INDEX_SYMBOLS = {"NIFTY 50": "NIFTY 50", "SENSEX": "SENSEX"}
+EXTRA_INDEX_IDS = {"NIFTY 50": 13}  # keep sensex id if you have it
 
 # -------------------------
-# Bot class
+# Utility functions
+# -------------------------
+def escape_markdown_v2(text: str) -> str:
+    """
+    Escape special characters for Telegram MarkdownV2.
+    Telegram MarkdownV2 special chars to escape: _ * [ ] ( ) ~ ` > # + - = | { } . !
+    """
+    if not text:
+        return text
+    to_escape = r'_*[]()~`>#+-=|{}.!'
+    escaped = []
+    for ch in str(text):
+        if ch in to_escape:
+            escaped.append('\\' + ch)
+        else:
+            escaped.append(ch)
+    return ''.join(escaped)
+
+def chunk_message(text: str, limit: int = 4000):
+    """Split text into chunks under limit preserving line breaks where possible."""
+    if len(text) <= limit:
+        return [text]
+    lines = text.splitlines(keepends=True)
+    chunks = []
+    current = ""
+    for ln in lines:
+        if len(current) + len(ln) <= limit:
+            current += ln
+        else:
+            if current:
+                chunks.append(current)
+            # if single line is larger than limit, hard-split
+            if len(ln) > limit:
+                for i in range(0, len(ln), limit):
+                    chunks.append(ln[i:i+limit])
+                current = ""
+            else:
+                current = ln
+    if current:
+        chunks.append(current)
+    return chunks
+
+# -------------------------
+# Bot
 # -------------------------
 class MultiLTPBot:
     def __init__(self):
@@ -96,66 +124,46 @@ class MultiLTPBot:
         logger.info("Bot initialized successfully with %d instruments", len(INSTRUMENTS))
     
     def _build_payload_for_symbols(self):
-        # Build symbol list for Dhan LTP endpoint
         symbols = []
-        # Add equities
         for display, sym in INSTRUMENTS.items():
             symbols.append(sym)
-        # Add index symbols (attempt)
         for name, sym in INDEX_SYMBOLS.items():
             symbols.append(sym)
         return {"S": symbols}
     
     def fetch_symbol_ltps(self):
-        """
-        Try symbol-based LTP fetch from DHAN_LTP_URL.
-        Returns a dict: { symbol_or_display: { 'last_price':..., 'prev_close':..., 'ohlc':{...}, ... } }
-        Best-effort parsing — DHAN responses can vary so we attempt several common shapes.
-        """
         payload = self._build_payload_for_symbols()
         try:
             resp = requests.post(DHAN_LTP_URL, json=payload, headers=self.headers, timeout=10)
             logger.info("LTP API status: %s", resp.status_code)
-            logger.debug("LTP raw response: %s", resp.text)
+            logger.debug("LTP raw response: %s", resp.text[:2000])  # truncated for logs
+            if resp.status_code == 429:
+                # rate-limited - log headers
+                ra = resp.headers.get("Retry-After")
+                logger.warning("Dhan LTP rate-limited (429). Retry-After: %s", ra)
+                return {"__429__": ra}
             if resp.status_code != 200:
                 logger.warning("Non-200 from LTP: %s", resp.status_code)
                 return {}
             j = resp.json()
-            
             result = {}
-            # Many DHAN-like APIs return {"status":"success","data":{"S": {"RELIANCE": {...}, "INFY": {...}}}}
             data = j.get("data") or {}
-            
-            # Try first: data.get("S")
             s_block = data.get("S") if isinstance(data, dict) else None
             if s_block and isinstance(s_block, dict):
                 for sym, info in s_block.items():
                     result[sym] = info
                 return result
-            
-            # Second try: maybe top-level keys are symbols
-            # e.g. data may be {"RELIANCE": {...}, "INFY": {...}}
+            # fallback attempts - collect any top-level symbol-like keys
+            requested = set(self._build_payload_for_symbols().get("S", []))
             if isinstance(data, dict):
-                # filter keys that match requested symbols
-                requested = set(self._build_payload_for_symbols().get("S", []))
                 for k, v in data.items():
                     if k in requested:
                         result[k] = v
-                if result:
-                    return result
-            
-            # Third try: some apis place payload under j directly
-            requested = set(self._build_payload_for_symbols().get("S", []))
-            for k, v in j.items():
-                if k in requested and isinstance(v, dict):
-                    result[k] = v
             if result:
                 return result
-            
-            # If nothing found, return empty dict (caller can fallback to index OHLC)
-            logger.warning("Symbol LTP parsing did not find expected structure.")
-            return {}
-        
+            # as a last resort, return entire data for inspection
+            logger.warning("Symbol LTP parsing did not find expected structure. Returning raw data for inspection.")
+            return {"__raw__": j}
         except requests.exceptions.Timeout:
             logger.error("LTP request timeout")
             return {}
@@ -167,17 +175,15 @@ class MultiLTPBot:
             return {}
     
     def fetch_index_ohlc(self, index_id):
-        """
-        Fetch OHLC for an index using DHAN_OHLC_URL and numeric index id (like earlier).
-        Returns parsed dict or None.
-        """
-        payload = {
-            "IDX_I": [index_id]
-        }
+        payload = {"IDX_I": [index_id]}
         try:
             resp = requests.post(DHAN_OHLC_URL, json=payload, headers=self.headers, timeout=10)
             logger.info("Index OHLC status: %s (id=%s)", resp.status_code, index_id)
-            logger.debug("Index OHLC raw: %s", resp.text)
+            logger.debug("Index OHLC raw: %s", resp.text[:2000])
+            if resp.status_code == 429:
+                ra = resp.headers.get("Retry-After")
+                logger.warning("Index OHLC rate-limited 429. Retry-After: %s", ra)
+                return {"__429__": ra}
             if resp.status_code != 200:
                 return None
             j = resp.json()
@@ -191,63 +197,37 @@ class MultiLTPBot:
             return None
     
     def build_report_from_data(self, symbol_ltps, index_ohlcs):
-        """
-        Build summary lines for each instrument.
-        symbol_ltps: dict from symbol -> info (best-effort fields)
-        index_ohlcs: dict name->ohlc (from extra index OHLC fetch)
-        """
         lines = []
         timestamp = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
         header = f"📊 *MULTI INSTRUMENT LTP*\n🕐 {timestamp}\n\n"
         lines.append(header)
         
-        # Helper to extract values robustly for a given info dict
         def parse_info(info):
-            # Typical fields we try: last_price, ltp, lt, last, prev_close, close, ohlc dict
             ltp = None
             prev_close = None
             ohlc = {}
-            if not info:
+            if not info or not isinstance(info, dict):
                 return {}
-            # common keys
             for k in ("last_price", "ltp", "last", "lastTradedPrice"):
-                if k in info and isinstance(info[k], (int, float)):
-                    ltp = info[k]
-                    break
-            # numeric in string form?
-            if ltp is None:
-                for k in ("last_price", "ltp", "last", "lastTradedPrice"):
-                    if k in info:
-                        try:
-                            ltp = float(info[k])
-                            break
-                        except:
-                            pass
-            # prev close
+                if k in info:
+                    try:
+                        ltp = float(info[k])
+                        break
+                    except:
+                        pass
             for k in ("prev_close", "close", "prevClose", "yClose"):
-                if k in info and isinstance(info[k], (int, float)):
-                    prev_close = info[k]
-                    break
-            if prev_close is None:
-                for k in ("prev_close", "close", "prevClose", "yClose"):
-                    if k in info:
-                        try:
-                            prev_close = float(info[k])
-                            break
-                        except:
-                            pass
-            # ohlc
+                if k in info:
+                    try:
+                        prev_close = float(info[k])
+                        break
+                    except:
+                        pass
             for k in ("ohlc", "OHLC"):
                 if k in info and isinstance(info[k], dict):
                     ohlc = info[k]
                     break
-            return {
-                "ltp": ltp,
-                "prev_close": prev_close,
-                "ohlc": ohlc
-            }
+            return {"ltp": ltp, "prev_close": prev_close, "ohlc": ohlc}
         
-        # Add equities / symbols
         for display_name, sym in INSTRUMENTS.items():
             info = symbol_ltps.get(sym) or symbol_ltps.get(display_name) or symbol_ltps.get(sym.upper())
             parsed = parse_info(info)
@@ -256,20 +236,18 @@ class MultiLTPBot:
             ohlc = parsed.get("ohlc") or {}
             change = None
             change_pct = None
-            if ltp is not None and prev:
+            if (ltp is not None) and (prev is not None):
                 try:
                     change = ltp - prev
                     change_pct = (change / prev) * 100 if prev != 0 else None
-                except Exception:
+                except:
                     change = None
-            # Build line
             if ltp is not None:
                 sign = "+" if (change is not None and change >= 0) else ""
                 emoji = "🟢" if (change is not None and change >= 0) else ("🔴" if change is not None else "")
                 line = f"*{display_name}* ({sym})\n• LTP: ₹{ltp:,.2f}"
                 if change is not None:
                     line += f"  {emoji} {sign}{change:,.2f} ({sign}{change_pct:.2f}%)"
-                # include prev close and intraday if available
                 prev_close_val = prev or ohlc.get("close") or ohlc.get("prev_close")
                 if prev_close_val:
                     line += f"\n• Prev Close: ₹{prev_close_val:,.2f}"
@@ -286,31 +264,22 @@ class MultiLTPBot:
                 line = f"*{display_name}* ({sym})\n• data unavailable"
             lines.append(line + "\n")
         
-        # Add indices (try parsed symbol LTP first, then fallback to index OHLC if provided)
         for idx_name, idx_sym in INDEX_SYMBOLS.items():
             info = symbol_ltps.get(idx_sym) or symbol_ltps.get(idx_name)
-            if info:
-                # parse similar to equities
-                parsed = {}
-                # try last_price or ltp
+            if info and isinstance(info, dict):
                 ltp = None
                 prev = None
-                if isinstance(info, dict):
-                    for k in ("last_price", "ltp", "last"):
-                        if k in info:
-                            try:
-                                ltp = float(info[k])
-                                break
-                            except:
-                                pass
-                    for k in ("prev_close", "close", "prevClose"):
-                        if k in info:
-                            try:
-                                prev = float(info[k])
-                                break
-                            except:
-                                pass
-                change = (ltp - prev) if (ltp is not None and prev) else None
+                for k in ("last_price", "ltp", "last"):
+                    if k in info:
+                        try:
+                            ltp = float(info[k]); break
+                        except: pass
+                for k in ("prev_close", "close", "prevClose"):
+                    if k in info:
+                        try:
+                            prev = float(info[k]); break
+                        except: pass
+                change = (ltp - prev) if (ltp is not None and prev is not None) else None
                 change_pct = (change / prev * 100) if (change is not None and prev) else None
                 sign = "+" if (change is not None and change >= 0) else ""
                 emoji = "🟢" if (change is not None and change >= 0) else ("🔴" if change is not None else "")
@@ -322,7 +291,6 @@ class MultiLTPBot:
                     line = f"*{idx_name}*\n• data unavailable"
                 lines.append(line + "\n")
             else:
-                # fallback to index_ohlcs dict passed in
                 ohlc_item = index_ohlcs.get(idx_name)
                 if ohlc_item:
                     ltp = ohlc_item.get("last_price") or ohlc_item.get("last") or ohlc_item.get("ltp")
@@ -353,16 +321,20 @@ class MultiLTPBot:
         lines.append(footer)
         return "\n".join(lines)
     
-    async def send_message(self, message):
-        try:
-            await self.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=message,
-                parse_mode='Markdown'
-            )
-            logger.info("Summary message sent")
-        except Exception as e:
-            logger.error(f"Error sending message: {e}")
+    async def send_text_safe(self, message_text: str):
+        """Send message safely: split into chunks, escape for MarkdownV2, fallback to plain text."""
+        chunks = chunk_message(message_text, limit=3900)  # keep margin
+        for chunk in chunks:
+            escaped = escape_markdown_v2(chunk)
+            try:
+                await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=escaped, parse_mode='MarkdownV2')
+                await asyncio.sleep(0.2)  # small pause to avoid hitting telegram rate limits
+            except Exception as e:
+                logger.error("MarkdownV2 send failed, falling back to plain text: %s", e)
+                try:
+                    await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=chunk, parse_mode=None)
+                except Exception as e2:
+                    logger.error("Plain text send also failed: %s", e2)
     
     async def send_startup_message(self):
         try:
@@ -376,12 +348,7 @@ class MultiLTPBot:
                 msg += f"• {n}\n"
             msg += "\n✅ Powered by Dhan API v2 (REST)\n"
             msg += "_Market Hours: 9:15 AM - 3:30 PM (Mon-Fri)_"
-            
-            await self.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=msg,
-                parse_mode='Markdown'
-            )
+            await self.send_text_safe(msg)
             logger.info("Startup message sent")
         except Exception as e:
             logger.error(f"Error sending startup message: {e}")
@@ -391,42 +358,47 @@ class MultiLTPBot:
         await self.send_startup_message()
         while self.running:
             try:
-                # 1) Try symbol-based LTP
-                symbol_ltps = self.fetch_symbol_ltps()  # dict keyed by symbol
-                index_ohlcs = {}
+                symbol_ltps = self.fetch_symbol_ltps()
                 
-                # 2) For indices where we have numeric IDs, fetch OHLC as fallback
+                # If LTP returned a 429 marker, respect Retry-After
+                if isinstance(symbol_ltps, dict) and "__429__" in symbol_ltps:
+                    ra = symbol_ltps.get("__429__")
+                    sleep_for = int(ra) if ra and ra.isdigit() else 10
+                    logger.warning("Sleeping %s seconds due to DHAN LTP 429", sleep_for)
+                    await asyncio.sleep(sleep_for)
+                    continue
+                
+                index_ohlcs = {}
                 for idx_name, idx_id in EXTRA_INDEX_IDS.items():
                     if idx_id:
                         item = self.fetch_index_ohlc(idx_id)
+                        if isinstance(item, dict) and "__429__" in item:
+                            ra = item.get("__429__")
+                            sleep_for = int(ra) if ra and ra.isdigit() else 10
+                            logger.warning("Sleeping %s seconds due to DHAN index 429", sleep_for)
+                            await asyncio.sleep(sleep_for)
+                            continue
                         if item:
                             index_ohlcs[idx_name] = item
                 
-                # 3) Build and send report
                 message = self.build_report_from_data(symbol_ltps, index_ohlcs)
-                await self.send_message(message)
-                
-                await asyncio.sleep(60)  # wait 1 minute
+                await self.send_text_safe(message)
+                await asyncio.sleep(60)
             except KeyboardInterrupt:
                 logger.info("Stopped by user")
                 self.running = False
                 break
             except Exception as e:
                 logger.error(f"Error in main loop: {e}")
-                # keep running after a short pause
-                await asyncio.sleep(60)
+                await asyncio.sleep(10)
 
 
-# -------------------------
-# Run bot
-# -------------------------
 if __name__ == "__main__":
     try:
         if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN]):
             logger.error("❌ Missing environment variables!")
             logger.error("Please set: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN")
             exit(1)
-        
         bot = MultiLTPBot()
         asyncio.run(bot.run())
     except Exception as e:
