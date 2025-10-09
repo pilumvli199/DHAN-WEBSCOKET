@@ -5,6 +5,13 @@ import requests
 from datetime import datetime
 import logging
 import csv
+import io
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+import mplfinance as mpf
+import pandas as pd
 
 # Logging setup
 logging.basicConfig(
@@ -27,6 +34,7 @@ DHAN_OHLC_URL = f"{DHAN_API_BASE}/v2/marketfeed/ohlc"
 DHAN_OPTION_CHAIN_URL = f"{DHAN_API_BASE}/v2/optionchain"
 DHAN_EXPIRY_LIST_URL = f"{DHAN_API_BASE}/v2/optionchain/expirylist"
 DHAN_INSTRUMENTS_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+DHAN_HISTORICAL_URL = f"{DHAN_API_BASE}/v2/charts/historical"
 
 # Stock/Index List - Symbol mapping
 STOCKS_INDICES = {
@@ -143,6 +151,127 @@ class DhanOptionChainBot:
         except Exception as e:
             logger.error(f"Error loading security IDs: {e}")
             return False
+    
+    def get_historical_data(self, security_id, segment, symbol):
+        """Last 199 candles चा historical data घेतो"""
+        try:
+            # Exchange code निवडतो
+            if segment == "IDX_I":
+                exch_seg = "IDX_I"
+            else:
+                exch_seg = "NSE_EQ"
+            
+            payload = {
+                "securityId": str(security_id),
+                "exchangeSegment": exch_seg,
+                "instrument": "EQUITY",
+                "expiryCode": 0,
+                "fromDate": "",
+                "toDate": ""
+            }
+            
+            response = requests.post(
+                DHAN_HISTORICAL_URL,
+                json=payload,
+                headers=self.headers,
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success' and data.get('data'):
+                    candles = data['data']
+                    # Last 199 candles घेतो
+                    return candles[-199:] if len(candles) > 199 else candles
+            
+            logger.warning(f"{symbol}: Historical data नाही मिळाला")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting historical data for {symbol}: {e}")
+            return None
+    
+    def create_candlestick_chart(self, candles, symbol, spot_price):
+        """Candlestick chart तयार करतो"""
+        try:
+            # DataFrame तयार करतो
+            df_data = []
+            for candle in candles:
+                df_data.append({
+                    'Date': pd.to_datetime(candle.get('start_Time', candle.get('timestamp', ''))),
+                    'Open': float(candle.get('open', 0)),
+                    'High': float(candle.get('high', 0)),
+                    'Low': float(candle.get('low', 0)),
+                    'Close': float(candle.get('close', 0)),
+                    'Volume': int(candle.get('volume', 0))
+                })
+            
+            df = pd.DataFrame(df_data)
+            df.set_index('Date', inplace=True)
+            
+            # Chart style
+            mc = mpf.make_marketcolors(
+                up='#26a69a',
+                down='#ef5350',
+                edge='inherit',
+                wick='inherit',
+                volume='in'
+            )
+            
+            s = mpf.make_mpf_style(
+                marketcolors=mc,
+                gridstyle='-',
+                gridcolor='#333333',
+                facecolor='#1e1e1e',
+                figcolor='#1e1e1e',
+                gridaxis='both',
+                y_on_right=False
+            )
+            
+            # Chart बनवतो
+            fig, axes = mpf.plot(
+                df,
+                type='candle',
+                style=s,
+                volume=True,
+                title=f'\n{symbol} - Last {len(candles)} Candles | Spot: ₹{spot_price:,.2f}',
+                ylabel='Price (₹)',
+                ylabel_lower='Volume',
+                figsize=(12, 8),
+                returnfig=True,
+                tight_layout=True
+            )
+            
+            # Title customize करतो
+            axes[0].set_title(
+                f'{symbol} - Last {len(candles)} Candles | Spot: ₹{spot_price:,.2f}',
+                color='white',
+                fontsize=14,
+                fontweight='bold',
+                pad=20
+            )
+            
+            # Axes color
+            for ax in axes:
+                ax.tick_params(colors='white', which='both')
+                ax.spines['bottom'].set_color('white')
+                ax.spines['top'].set_color('white')
+                ax.spines['left'].set_color('white')
+                ax.spines['right'].set_color('white')
+                ax.xaxis.label.set_color('white')
+                ax.yaxis.label.set_color('white')
+            
+            # Memory buffer मध्ये save करतो
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='#1e1e1e')
+            buf.seek(0)
+            plt.close(fig)
+            
+            return buf
+            
+        except Exception as e:
+            logger.error(f"Error creating chart for {symbol}: {e}")
+            return None
     
     def get_nearest_expiry(self, security_id, segment):
         """सर्वात जवळचा expiry काढतो"""
@@ -269,7 +398,7 @@ class DhanOptionChainBot:
             return None
     
     async def send_option_chain_batch(self, symbols_batch):
-        """एका batch चे option chain data पाठवतो"""
+        """एका batch चे option chain data + chart पाठवतो"""
         for symbol in symbols_batch:
             try:
                 if symbol not in self.security_id_map:
@@ -286,7 +415,7 @@ class DhanOptionChainBot:
                     logger.warning(f"{symbol}: Expiry नाही मिळाला")
                     continue
                 
-                logger.info(f"Fetching option chain for {symbol} (Expiry: {expiry})...")
+                logger.info(f"Fetching data for {symbol} (Expiry: {expiry})...")
                 
                 # Option chain data घेतो
                 oc_data = self.get_option_chain(security_id, segment, expiry)
@@ -294,7 +423,29 @@ class DhanOptionChainBot:
                     logger.warning(f"{symbol}: Option chain data नाही मिळाला")
                     continue
                 
-                # Message format करतो
+                spot_price = oc_data.get('last_price', 0)
+                
+                # Historical data घेतो (candles साठी)
+                logger.info(f"Fetching historical candles for {symbol}...")
+                candles = self.get_historical_data(security_id, segment, symbol)
+                
+                # Chart तयार करतो
+                chart_buf = None
+                if candles:
+                    logger.info(f"Creating candlestick chart for {symbol}...")
+                    chart_buf = self.create_candlestick_chart(candles, symbol, spot_price)
+                
+                # Chart पाठवतो (जर available असेल तर)
+                if chart_buf:
+                    await self.bot.send_photo(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        photo=chart_buf,
+                        caption=f"📊 {symbol} - Last {len(candles)} Candles Chart"
+                    )
+                    logger.info(f"✅ {symbol} chart sent")
+                    await asyncio.sleep(1)
+                
+                # Option chain message format करतो
                 message = self.format_option_chain_message(symbol, oc_data, expiry)
                 if message:
                     await self.bot.send_message(
@@ -312,7 +463,7 @@ class DhanOptionChainBot:
                 await asyncio.sleep(3)
     
     async def run(self):
-        """Main loop - every 5 minutes option chain पाठवतो"""
+        """Main loop - every 5 minutes option chain + chart पाठवतो"""
         logger.info("🚀 Bot started! Loading security IDs...")
         
         # Security IDs load करतो
@@ -334,7 +485,7 @@ class DhanOptionChainBot:
             try:
                 timestamp = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
                 logger.info(f"\n{'='*50}")
-                logger.info(f"Starting option chain update cycle at {timestamp}")
+                logger.info(f"Starting update cycle at {timestamp}")
                 logger.info(f"{'='*50}")
                 
                 # प्रत्येक batch process करतो
@@ -367,7 +518,10 @@ class DhanOptionChainBot:
             msg = "🤖 *Dhan Option Chain Bot Started!*\n\n"
             msg += f"📊 Tracking {len(self.security_id_map)} stocks/indices\n"
             msg += "⏱️ Updates every 5 minutes\n"
-            msg += "📈 Option Chain: CE/PE LTP, OI, Volume, Greeks, IV\n\n"
+            msg += "📈 Features:\n"
+            msg += "  • Candlestick Charts (Last 199 candles)\n"
+            msg += "  • Option Chain: CE/PE LTP, OI, Volume\n"
+            msg += "  • Greeks & Implied Volatility\n\n"
             msg += "✅ Powered by DhanHQ API v2\n"
             msg += "🚂 Deployed on Railway.app\n\n"
             msg += "_Market Hours: 9:15 AM - 3:30 PM (Mon-Fri)_"
