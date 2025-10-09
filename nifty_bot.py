@@ -47,16 +47,16 @@ DHAN_INTRADAY_URL = f"{DHAN_API_BASE}/v2/charts/intraday"
 
 # Stock/Index List
 STOCKS_INDICES = {
-    "NIFTY 50": {"symbol": "NIFTY 50", "segment": "IDX_I"},
-    "NIFTY BANK": {"symbol": "NIFTY BANK", "segment": "IDX_I"},
-    "RELIANCE": {"symbol": "RELIANCE", "segment": "NSE_EQ"},
-    "HDFCBANK": {"symbol": "HDFCBANK", "segment": "NSE_EQ"},
-    "ICICIBANK": {"symbol": "ICICIBANK", "segment": "NSE_EQ"},
-    "BAJFINANCE": {"symbol": "BAJFINANCE", "segment": "NSE_EQ"},
-    "INFY": {"symbol": "INFY", "segment": "NSE_EQ"},
-    "TATAMOTORS": {"symbol": "TATAMOTORS", "segment": "NSE_EQ"},
-    "AXISBANK": {"symbol": "AXISBANK", "segment": "NSE_EQ"},
-    "SBIN": {"symbol": "SBIN", "segment": "NSE_EQ"},
+    "NIFTY": {"symbol": "Nifty 50", "segment": "IDX_I", "search_variants": ["NIFTY 50", "Nifty 50", "NIFTY"]},
+    "BANKNIFTY": {"symbol": "Nifty Bank", "segment": "IDX_I", "search_variants": ["NIFTY BANK", "Nifty Bank", "BANKNIFTY"]},
+    "RELIANCE": {"symbol": "RELIANCE", "segment": "NSE_EQ", "search_variants": ["RELIANCE"]},
+    "HDFCBANK": {"symbol": "HDFCBANK", "segment": "NSE_EQ", "search_variants": ["HDFCBANK"]},
+    "ICICIBANK": {"symbol": "ICICIBANK", "segment": "NSE_EQ", "search_variants": ["ICICIBANK"]},
+    "BAJFINANCE": {"symbol": "BAJFINANCE", "segment": "NSE_EQ", "search_variants": ["BAJFINANCE"]},
+    "INFY": {"symbol": "INFY", "segment": "NSE_EQ", "search_variants": ["INFY"]},
+    "TATAMOTORS": {"symbol": "TATAMOTORS", "segment": "NSE_EQ", "search_variants": ["TATAMOTORS"]},
+    "AXISBANK": {"symbol": "AXISBANK", "segment": "NSE_EQ", "search_variants": ["AXISBANK"]},
+    "SBIN": {"symbol": "SBIN", "segment": "NSE_EQ", "search_variants": ["SBIN"]},
 }
 
 # ========================
@@ -93,24 +93,28 @@ class FnOTradingBot:
                 for symbol, info in STOCKS_INDICES.items():
                     segment = info['segment']
                     symbol_name = info['symbol']
+                    search_variants = info.get('search_variants', [symbol_name])
                     
                     # Parse CSV for each symbol
                     csv_data = csv_text.split('\n')
                     reader = csv.DictReader(csv_data)
                     
+                    found = False
                     for row in reader:
                         try:
                             if segment == "IDX_I":
-                                if (row.get('SEM_SEGMENT') == 'I' and 
-                                    row.get('SEM_TRADING_SYMBOL') == symbol_name):
+                                trading_symbol = row.get('SEM_TRADING_SYMBOL', '')
+                                # Try all variants
+                                if row.get('SEM_SEGMENT') == 'I' and trading_symbol in search_variants:
                                     sec_id = row.get('SEM_SMST_SECURITY_ID')
                                     if sec_id:
                                         self.security_id_map[symbol] = {
                                             'security_id': int(sec_id),
                                             'segment': segment,
-                                            'trading_symbol': symbol_name
+                                            'trading_symbol': trading_symbol
                                         }
-                                        logger.info(f"✅ {symbol}: Security ID = {sec_id}")
+                                        logger.info(f"✅ {symbol}: Security ID = {sec_id} (Found as: {trading_symbol})")
+                                        found = True
                                         break
                             else:
                                 if (row.get('SEM_SEGMENT') == 'E' and 
@@ -124,9 +128,13 @@ class FnOTradingBot:
                                             'trading_symbol': symbol_name
                                         }
                                         logger.info(f"✅ {symbol}: Security ID = {sec_id}")
+                                        found = True
                                         break
                         except Exception as e:
                             continue
+                    
+                    if not found:
+                        logger.warning(f"⚠️ {symbol}: Not found in CSV (tried variants: {search_variants})")
                 
                 logger.info(f"Total {len(self.security_id_map)} securities loaded")
                 return True
