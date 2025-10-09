@@ -1,96 +1,42 @@
-#!/usr/bin/env python3
-"""
-Minimal Test Bot - Debug Railway Issues
-"""
-import sys
+import asyncio
 import os
+import sys
+import requests
+import logging
+import csv
+import io
+import base64
+import json
+from datetime import datetime, timedelta
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-print("="*60, flush=True)
-print("🚀 MINIMAL TEST BOT STARTING", flush=True)
-print("="*60, flush=True)
+# Third-party libraries
+from telegram import Bot
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import mplfinance as mpf
+import google.generativeai as genai
+from openai import OpenAI
 
-# Step 1: Basic imports
-print("\n1️⃣ Testing basic imports...", flush=True)
-try:
-    import asyncio
-    print("   ✅ asyncio", flush=True)
-    
-    import requests
-    print("   ✅ requests", flush=True)
-    
-    from datetime import datetime
-    print("   ✅ datetime", flush=True)
-    
-    import logging
-    print("   ✅ logging", flush=True)
-    
-except Exception as e:
-    print(f"   ❌ Basic imports failed: {e}", flush=True)
-    sys.exit(1)
+# Force stdout flush for deployment logs (like Railway)
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
-# Step 2: Matplotlib (This usually fails on Railway!)
-print("\n2️⃣ Testing matplotlib...", flush=True)
-try:
-    import matplotlib
-    print(f"   📦 matplotlib version: {matplotlib.__version__}", flush=True)
-    
-    matplotlib.use('Agg')
-    print("   ✅ Set backend to 'Agg'", flush=True)
-    
-    import matplotlib.pyplot as plt
-    print("   ✅ matplotlib.pyplot", flush=True)
-    
-except Exception as e:
-    print(f"   ❌ matplotlib failed: {e}", flush=True)
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
+# ========================
+# LOGGING SETUP
+# ========================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Step 3: Other heavy imports
-print("\n3️⃣ Testing heavy imports...", flush=True)
-try:
-    import mplfinance as mpf
-    print("   ✅ mplfinance", flush=True)
-    
-    import pandas as pd
-    print("   ✅ pandas", flush=True)
-    
-except Exception as e:
-    print(f"   ❌ Heavy imports failed: {e}", flush=True)
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
-
-# Step 4: AI imports
-print("\n4️⃣ Testing AI imports...", flush=True)
-try:
-    import google.generativeai as genai
-    print("   ✅ google.generativeai", flush=True)
-    
-    from openai import OpenAI
-    print("   ✅ openai", flush=True)
-    
-except Exception as e:
-    print(f"   ❌ AI imports failed: {e}", flush=True)
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
-
-# Step 5: Telegram
-print("\n5️⃣ Testing telegram...", flush=True)
-try:
-    from telegram import Bot
-    print("   ✅ telegram.Bot", flush=True)
-    
-except Exception as e:
-    print(f"   ❌ Telegram import failed: {e}", flush=True)
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
-
-# Step 6: Environment variables
-print("\n6️⃣ Checking environment variables...", flush=True)
-
+# ========================
+# CONFIGURATION
+# ========================
+# Load environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
@@ -98,78 +44,490 @@ DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-env_status = {
-    'TELEGRAM_BOT_TOKEN': '✅' if TELEGRAM_BOT_TOKEN else '❌',
-    'TELEGRAM_CHAT_ID': '✅' if TELEGRAM_CHAT_ID else '❌',
-    'DHAN_CLIENT_ID': '✅' if DHAN_CLIENT_ID else '❌',
-    'DHAN_ACCESS_TOKEN': '✅' if DHAN_ACCESS_TOKEN else '❌',
-    'GEMINI_API_KEY': '✅' if GEMINI_API_KEY else '❌',
-    'OPENAI_API_KEY': '✅' if OPENAI_API_KEY else '❌',
+# AI Setup
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+except Exception as e:
+    logger.critical(f"❌ Failed to configure AI clients: {e}")
+    sys.exit(1) # Exit if AI keys are not set
+
+# Dhan API URLs
+DHAN_API_BASE = "https://api.dhan.co"
+DHAN_INTRADAY_URL = f"{DHAN_API_BASE}/v2/charts/intraday"
+DHAN_OPTION_CHAIN_URL = f"{DHAN_API_BASE}/v2/optionchain"
+DHAN_EXPIRY_LIST_URL = f"{DHAN_API_BASE}/v2/optionchain/expirylist"
+DHAN_INSTRUMENTS_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+
+# Stock/Index Watchlist
+STOCKS_INDICES = {
+    "NIFTY": {"symbol": "Nifty 50", "segment": "IDX_I", "search_variants": ["NIFTY 50", "Nifty 50", "NIFTY"]},
+    "BANKNIFTY": {"symbol": "Nifty Bank", "segment": "IDX_I", "search_variants": ["NIFTY BANK", "Nifty Bank", "BANKNIFTY"]},
+    "RELIANCE": {"symbol": "RELIANCE", "segment": "NSE_EQ", "search_variants": ["RELIANCE"]},
+    "HDFCBANK": {"symbol": "HDFCBANK", "segment": "NSE_EQ", "search_variants": ["HDFCBANK"]},
+    "ICICIBANK": {"symbol": "ICICIBANK", "segment": "NSE_EQ", "search_variants": ["ICICIBANK"]},
+    "BAJFINANCE": {"symbol": "BAJFINANCE", "segment": "NSE_EQ", "search_variants": ["BAJFINANCE"]},
+    "INFY": {"symbol": "INFY", "segment": "NSE_EQ", "search_variants": ["INFY"]},
+    "TATAMOTORS": {"symbol": "TATAMOTORS", "segment": "NSE_EQ", "search_variants": ["TATAMOTORS"]},
+    "AXISBANK": {"symbol": "AXISBANK", "segment": "NSE_EQ", "search_variants": ["AXISBANK"]},
+    "SBIN": {"symbol": "SBIN", "segment": "NSE_EQ", "search_variants": ["SBIN"]},
 }
 
-for var, status in env_status.items():
-    print(f"   {status} {var}", flush=True)
+# ========================
+# F&O TRADING BOT v2.0
+# ========================
 
-missing = [k for k, v in env_status.items() if v == '❌']
-if missing:
-    print(f"\n   ⚠️ Missing: {', '.join(missing)}", flush=True)
-else:
-    print("\n   ✅ All environment variables set!", flush=True)
-
-# Step 7: Start HTTP server for Railway
-print("\n7️⃣ Starting HTTP server...", flush=True)
-try:
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-    from threading import Thread
-    
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            status = "✅ Bot is running!\n\n"
-            status += "Environment:\n"
-            for var, st in env_status.items():
-                status += f"{st} {var}\n"
-            self.wfile.write(status.encode())
+class FnOTradingBot:
+    def __init__(self):
+        self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        self.running = True
+        self.headers = {
+            'access-token': DHAN_ACCESS_TOKEN,
+            'client-id': DHAN_CLIENT_ID,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+        self.security_id_map = {}
         
-        def log_message(self, format, *args):
-            pass
+        # Initialize AI Models
+        self.gemini_flash = genai.GenerativeModel('gemini-1.5-flash')
+        self.gemini_pro = genai.GenerativeModel('gemini-1.5-pro')
+        
+        logger.info("🚀 F&O Trading Bot v2.0 initialized")
     
-    port = int(os.getenv('PORT', 8080))
-    server = HTTPServer(('0.0.0.0', port), Handler)
-    
-    thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    
-    print(f"   ✅ HTTP server running on port {port}", flush=True)
-    print(f"   🌐 Health endpoint: http://0.0.0.0:{port}/", flush=True)
-    
-except Exception as e:
-    print(f"   ❌ HTTP server failed: {e}", flush=True)
-    import traceback
-    traceback.print_exc()
+    async def load_security_ids(self):
+        """Loads security IDs from Dhan's master CSV file."""
+        try:
+            logger.info("Downloading Dhan instruments master file...")
+            response = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
+            response.raise_for_status()  # Raise an exception for bad status codes
+            
+            csv_text = response.text
+            reader = csv.DictReader(io.StringIO(csv_text))
+            
+            all_rows = list(reader) # Read all rows into memory for faster searching
+            
+            for symbol, info in STOCKS_INDICES.items():
+                segment_code = 'I' if info['segment'] == 'IDX_I' else 'E'
+                search_variants = info['search_variants']
+                
+                found = False
+                for row in all_rows:
+                    try:
+                        is_match = False
+                        # Match Index
+                        if segment_code == 'I' and row.get('SEM_SEGMENT') == 'I':
+                            if row.get('SEM_TRADING_SYMBOL') in search_variants:
+                                is_match = True
+                        # Match Equity
+                        elif segment_code == 'E' and row.get('SEM_SEGMENT') == 'E':
+                            if row.get('SEM_TRADING_SYMBOL') in search_variants and row.get('SEM_EXM_EXCH_ID') == 'NSE':
+                                is_match = True
+                        
+                        if is_match:
+                            sec_id = row.get('SEM_SMST_SECURITY_ID')
+                            trading_symbol = row.get('SEM_TRADING_SYMBOL')
+                            if sec_id:
+                                self.security_id_map[symbol] = {
+                                    'security_id': int(sec_id),
+                                    'segment': info['segment'],
+                                    'trading_symbol': trading_symbol
+                                }
+                                logger.info(f"✅ {symbol}: Security ID = {sec_id} (Found as: {trading_symbol})")
+                                found = True
+                                break
+                    except (ValueError, TypeError):
+                        continue # Ignore rows with bad data
+                
+                if not found:
+                    logger.warning(f"⚠️ {symbol}: Not found in CSV (tried variants: {search_variants})")
 
-# Step 8: Keep alive
-print("\n8️⃣ Bot initialization complete!", flush=True)
-print("="*60, flush=True)
-print("✅ ALL CHECKS PASSED!", flush=True)
-print("🔄 Bot will keep running...", flush=True)
-print("="*60, flush=True)
+            logger.info(f"Total {len(self.security_id_map)} securities loaded.")
+            return True
 
-# Keep the bot alive
-try:
-    import time
-    counter = 0
-    while True:
-        counter += 1
-        if counter % 60 == 0:  # Every 60 seconds
-            print(f"💚 Bot alive - {counter} seconds elapsed", flush=True)
-        time.sleep(1)
-except KeyboardInterrupt:
-    print("\n⚠️ Bot stopped", flush=True)
-except Exception as e:
-    print(f"\n❌ Error: {e}", flush=True)
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to download instruments file: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Error loading security IDs: {e}")
+            return False
+
+    def get_historical_data(self, security_id, segment, symbol):
+        """Fetches historical intraday data for the last few days."""
+        try:
+            exch_seg = "IDX" if segment == "IDX_I" else "NSE_EQ"
+            instrument_type = "INDEX" if segment == "IDX_I" else "EQUITY"
+            
+            to_date = datetime.now()
+            from_date = to_date - timedelta(days=7) # Fetch a week's data to ensure enough candles
+            
+            payload = {
+                "securityId": str(security_id),
+                "exchangeSegment": exch_seg,
+                "instrument": instrument_type,
+                "expiryDate": "0", # For equity/index, not options
+                "fromDate": from_date.strftime("%Y-%m-%d"),
+                "toDate": to_date.strftime("%Y-%m-%d"),
+                "interval": "FIVE_MINUTE" # Use documented interval value
+            }
+            
+            logger.info(f"📊 Fetching chart data for {symbol}...")
+            response = requests.post(DHAN_INTRADAY_URL, json=payload, headers=self.headers, timeout=15)
+            response.raise_for_status()
+            
+            data = response.json()
+            if 'data' in data and data.get('status') == 'success':
+                candle_data = data['data']
+                df = pd.DataFrame({
+                    'Date': pd.to_datetime(candle_data['start_Time'], unit='s'),
+                    'Open': candle_data['open'],
+                    'High': candle_data['high'],
+                    'Low': candle_data['low'],
+                    'Close': candle_data['close'],
+                    'Volume': candle_data['volume']
+                })
+                logger.info(f"✅ {symbol}: Got {len(df)} candles")
+                return df
+            else:
+                logger.warning(f"⚠️ {symbol}: No candle data in response or API error. Response: {data}")
+                return None
+        except Exception as e:
+            logger.error(f"❌ Error getting historical data for {symbol}: {e}")
+            return None
+
+    def create_candlestick_chart(self, df, symbol, spot_price):
+        """Creates a candlestick chart image from a pandas DataFrame."""
+        try:
+            if df is None or len(df) < 2:
+                logger.warning(f"{symbol}: Not enough data for chart.")
+                return None
+
+            df.set_index('Date', inplace=True)
+            
+            # Dark theme style for the chart
+            mc = mpf.make_marketcolors(up='#26a69a', down='#ef5350', inherit=True)
+            s = mpf.make_mpf_style(marketcolors=mc, base_mpf_style='nightclouds')
+
+            fig, axes = mpf.plot(
+                df.tail(150), # Plot last 150 candles
+                type='candle',
+                style=s,
+                volume=True,
+                title=f'\n{symbol} | Spot: ₹{spot_price:,.2f}',
+                ylabel='Price (₹)',
+                figsize=(15, 8),
+                returnfig=True,
+                tight_layout=True
+            )
+            
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=100)
+            buf.seek(0)
+            
+            logger.info(f"✅ Chart created for {symbol}")
+            return buf
+        except Exception as e:
+            logger.error(f"❌ Error creating chart for {symbol}: {e}")
+            return None
+
+    def get_option_chain(self, security_id, segment, symbol):
+        """Fetches the full option chain for a given security."""
+        try:
+            payload = {
+                "securityId": str(security_id),
+                "exchangeSegment": "NSE_FNO" # Option chain is in FNO segment
+            }
+            logger.info(f"⛓️ Fetching option chain for {symbol}...")
+            response = requests.get(DHAN_OPTION_CHAIN_URL, params=payload, headers=self.headers, timeout=15)
+            response.raise_for_status()
+
+            data = response.json()
+            if data.get('status') == 'success' and 'data' in data:
+                logger.info(f"✅ Option chain loaded for {symbol}")
+                return data['data']
+            else:
+                logger.error(f"❌ Option chain API error for {symbol}: {data.get('remarks')}")
+                return None
+        except Exception as e:
+            logger.error(f"❌ Error getting option chain for {symbol}: {e}")
+            return None
+
+    def pre_filter_stock(self, symbol, oc_data):
+        """Pre-filters the stock based on OI, PCR, and IV."""
+        try:
+            if not oc_data:
+                return False, "No option chain data"
+            
+            spot_price = oc_data.get('spotPrice', 0)
+            total_ce_oi = oc_data.get('totalCE_OI', 0)
+            total_pe_oi = oc_data.get('totalPE_OI', 0)
+
+            if total_ce_oi == 0 or total_pe_oi == 0:
+                return False, "OI data is zero"
+
+            # 1. PCR Check
+            pcr = total_pe_oi / total_ce_oi
+            if not (0.7 <= pcr <= 1.5):
+                return False, f"PCR out of range: {pcr:.2f}"
+            
+            # 2. Find ATM strike to check IV
+            all_strikes = [d['strikePrice'] for d in oc_data.get('optionChainDetails', [])]
+            if not all_strikes:
+                return False, "No strikes found in option chain"
+            
+            atm_strike = min(all_strikes, key=lambda x: abs(x - spot_price))
+            
+            # 3. IV Check
+            avg_iv = 0
+            count = 0
+            for details in oc_data.get('optionChainDetails', []):
+                if abs(details['strikePrice'] - atm_strike) <= 200: # Check IV for strikes near ATM
+                    if details.get('ce_impledVolatility', 0) > 0:
+                        avg_iv += details['ce_impledVolatility']
+                        count += 1
+            if count > 0:
+                avg_iv /= count
+            
+            if avg_iv > 50:
+                 return False, f"High IV: {avg_iv:.1f}%"
+            
+            logger.info(f"✅ {symbol} PASSED pre-filter: PCR={pcr:.2f}, IV={avg_iv:.1f}%")
+            return True, {'pcr': pcr, 'iv': avg_iv, 'atm_strike': atm_strike}
+
+        except Exception as e:
+            logger.error(f"❌ Pre-filter error for {symbol}: {e}")
+            return False, str(e)
+
+    def format_data_for_ai(self, symbol, oc_data, df):
+        """Formats option chain and candle data into a single text block for AI analysis."""
+        try:
+            spot_price = oc_data.get('spotPrice', 0)
+            atm_strike = min([d['strikePrice'] for d in oc_data['optionChainDetails']], key=lambda x: abs(x - spot_price))
+
+            # Option Chain Text
+            text = f"ANALYSIS FOR: {symbol.upper()}\n"
+            text += f"CURRENT SPOT PRICE: {spot_price:,.2f}\n"
+            text += f"ATM STRIKE: {atm_strike:,.0f}\n\n"
+            text += "--- OPTION CHAIN (Near ATM) ---\n"
+            text += "STRIKE | CE LTP | CE OI (Lakhs) | PE LTP | PE OI (Lakhs)\n"
+            text += "-" * 55 + "\n"
+
+            for detail in sorted(oc_data['optionChainDetails'], key=lambda x: x['strikePrice']):
+                if abs(detail['strikePrice'] - atm_strike) <= 300: # 3 strikes above and below ATM
+                    strike = detail['strikePrice']
+                    ce_ltp = detail.get('ce_lastPrice', 0)
+                    ce_oi = detail.get('ce_openInterest', 0) / 100000
+                    pe_ltp = detail.get('pe_lastPrice', 0)
+                    pe_oi = detail.get('pe_openInterest', 0) / 100000
+                    text += f"{strike:<6.0f} | {ce_ltp:<6.2f} | {ce_oi:<15.2f} | {pe_ltp:<6.2f} | {pe_oi:<15.2f}\n"
+
+            # Candle Data Text
+            text += "\n--- RECENT PRICE ACTION (Last 15 Candles) ---\n"
+            text += "Time (IST)        | Open   | High   | Low    | Close  | Volume\n"
+            text += "-" * 70 + "\n"
+            for _, row in df.tail(15).iterrows():
+                time_str = row.name.strftime('%H:%M')
+                text += f"{time_str:<19} | {row.Open:<6.2f} | {row.High:<6.2f} | {row.Low:<6.2f} | {row.Close:<6.2f} | {row.Volume:,}\n"
+
+            return text
+
+        except Exception as e:
+            logger.error(f"❌ Error formatting data for AI: {e}")
+            return "Error formatting data."
+
+    async def run_ai_analysis(self, model, symbol, chart_buf, formatted_text, prompt):
+        """Generic function to run analysis on a specific AI model."""
+        try:
+            chart_buf.seek(0)
+            image_bytes = chart_buf.read()
+            
+            logger.info(f"🧠 Running {model.model_name.split('/')[-1]} analysis for {symbol}...")
+            
+            response = await model.generate_content_async([
+                prompt,
+                formatted_text,
+                {"mime_type": "image/png", "data": image_bytes}
+            ])
+            
+            # Clean and parse JSON
+            result_text = response.text.strip().replace('```json', '').replace('```', '')
+            result = json.loads(result_text)
+            return result
+
+        except Exception as e:
+            logger.error(f"❌ AI analysis error ({model.model_name}) for {symbol}: {e}")
+            return None
+
+    async def send_trade_alert(self, trade_signal):
+        """Formats and sends the final trade signal to Telegram."""
+        try:
+            symbol = trade_signal['symbol']
+            pro_result = trade_signal['pro']
+            chart_buf = trade_signal['chart']
+            
+            caption = f"🚨 **Trade Alert: {symbol}** 🚨\n\n"
+            caption += f"**Signal:** {pro_result.get('signal', 'N/A').upper()}\n"
+            caption += f"**Entry Option:** {pro_result.get('entry_option', 'N/A')}\n"
+            caption += f"**Entry Price:** ₹{pro_result.get('entry_price', 0):.2f}\n"
+            caption += f"**Target:** ₹{pro_result.get('target_price', 0):.2f}\n"
+            caption += f"**Stop Loss:** ₹{pro_result.get('stop_loss', 0):.2f}\n"
+            caption += f"**Risk:Reward:** {pro_result.get('risk_reward', 'N/A')}\n\n"
+            caption += f"**Confidence:** {pro_result.get('confidence', 0)}%\n\n"
+            caption += f"**Strategy:**\n_{pro_result.get('strategy', 'Not available.')}_"
+            
+            chart_buf.seek(0)
+            await self.bot.send_photo(
+                chat_id=TELEGRAM_CHAT_ID,
+                photo=chart_buf,
+                caption=caption,
+                parse_mode='Markdown'
+            )
+            logger.info(f"✅ Trade alert sent to Telegram for {symbol}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to send Telegram alert for {symbol}: {e}")
+
+    async def process_stock(self, symbol):
+        """Runs the complete analysis pipeline for a single stock."""
+        try:
+            if symbol not in self.security_id_map:
+                logger.warning(f"Skipping {symbol}, not found in security map.")
+                return
+
+            info = self.security_id_map[symbol]
+            security_id = info['security_id']
+            segment = info['segment']
+            
+            # 1. Get Option Chain and Pre-filter
+            oc_data = self.get_option_chain(security_id, segment, symbol)
+            if not oc_data:
+                return
+            
+            passed, filter_reason = self.pre_filter_stock(symbol, oc_data)
+            if not passed:
+                logger.info(f"➡️ {symbol} filtered out: {filter_reason}")
+                return
+            
+            spot_price = oc_data.get('spotPrice', 0)
+
+            # 2. Get Historical Data
+            df = self.get_historical_data(security_id, segment, symbol)
+            if df is None or len(df) < 50: # Need enough data for analysis
+                logger.warning(f"⚠️ {symbol}: Insufficient candle data ({len(df) if df is not None else 0})")
+                return
+
+            # 3. Create Chart and Format Data for AI
+            chart_buf = self.create_candlestick_chart(df, symbol, spot_price)
+            if not chart_buf: return
+
+            formatted_text = self.format_data_for_ai(symbol, oc_data, df)
+            
+            # 4. Stage 1: Gemini Flash Scan
+            flash_prompt = """
+            Analyze the provided chart, option chain, and candle data for a quick trading opportunity.
+            Respond in JSON with: {"tradeable": boolean, "signal": "bullish/bearish/neutral", "reason": "brief reason"}
+            """
+            flash_result = await self.run_ai_analysis(self.gemini_flash, symbol, chart_buf, formatted_text, flash_prompt)
+            if not flash_result or not flash_result.get('tradeable'):
+                logger.info(f"➡️ {symbol} not tradeable per Gemini Flash.")
+                return
+
+            # 5. Stage 2: Gemini Pro for Strategy
+            pro_prompt = f"""
+            Gemini Flash found a '{flash_result.get('signal')}' signal. Now, create a precise F&O trade plan.
+            Analyze all data and respond in JSON with:
+            {{
+                "signal": "bullish/bearish",
+                "entry_option": "e.g., 22500 CE or 22400 PE",
+                "entry_price": float,
+                "target_price": float,
+                "stop_loss": float,
+                "risk_reward": "e.g., 1:2.5",
+                "confidence": integer (0-100),
+                "strategy": "Detailed step-by-step strategy and reasoning."
+            }}
+            """
+            pro_result = await self.run_ai_analysis(self.gemini_pro, symbol, chart_buf, formatted_text, pro_prompt)
+            if not pro_result or pro_result.get('confidence', 0) < 65: # Confidence threshold
+                logger.info(f"➡️ {symbol} rejected by Gemini Pro due to low confidence.")
+                return
+                
+            # Final Trade Signal
+            trade_signal = {
+                'symbol': symbol,
+                'pro': pro_result,
+                'chart': chart_buf
+            }
+            logger.info(f"🎯🎯🎯 {symbol} TRADE SIGNAL GENERATED! 🎯🎯🎯")
+            await self.send_trade_alert(trade_signal)
+
+        except Exception as e:
+            logger.error(f"❌ FATAL error processing {symbol}: {e}", exc_info=True)
+
+# ========================
+# HTTP SERVER FOR DEPLOYMENT
+# ========================
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is alive and running!")
+
+def run_server():
+    """Runs a simple HTTP server to keep the bot alive on deployment platforms."""
+    port = int(os.environ.get("PORT", 8080))
+    server_address = ('', port)
+    try:
+        httpd = HTTPServer(server_address, KeepAliveHandler)
+        logger.info(f"Starting keep-alive server on port {port}...")
+        httpd.serve_forever()
+    except Exception as e:
+        logger.critical(f"Could not start HTTP server: {e}")
+
+# ========================
+# MAIN EXECUTION
+# ========================
+async def main():
+    """Main function to initialize and run the bot."""
+    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, GEMINI_API_KEY]):
+        logger.critical("❌ Missing one or more critical environment variables. Exiting.")
+        return
+
+    # Start the keep-alive server in a separate thread
+    server_thread = Thread(target=run_server, daemon=True)
+    server_thread.start()
+
+    bot_instance = FnOTradingBot()
+    
+    # Load security IDs at the very start
+    if await bot_instance.load_security_ids():
+        await bot_instance.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text="✅ **F&O Trading Bot v2.0 is ONLINE**\nInitializing first scan cycle...",
+            parse_mode='Markdown'
+        )
+
+        # Main loop to process stocks periodically
+        while bot_instance.running:
+            logger.info("============== NEW SCAN CYCLE ==============")
+            # Create a list of tasks to run concurrently
+            tasks = [bot_instance.process_stock(stock) for stock in STOCKS_INDICES.keys()]
+            await asyncio.gather(*tasks)
+            
+            logger.info(f"Scan cycle complete. Waiting for 5 minutes...")
+            await asyncio.sleep(300) # Wait for 5 minutes
+    else:
+        await bot_instance.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text="❌ **Bot failed to start.**\nCould not load security IDs from Dhan. Check logs.",
+            parse_mode='Markdown'
+        )
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped manually.")
+    except Exception as e:
+        logger.critical(f"A critical error occurred in main: {e}", exc_info=True)
