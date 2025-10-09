@@ -88,12 +88,15 @@ class FnOTradingBot:
             response = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
             
             if response.status_code == 200:
-                csv_data = response.text.split('\n')
-                reader = csv.DictReader(csv_data)
+                csv_text = response.text
                 
                 for symbol, info in STOCKS_INDICES.items():
                     segment = info['segment']
                     symbol_name = info['symbol']
+                    
+                    # Parse CSV for each symbol
+                    csv_data = csv_text.split('\n')
+                    reader = csv.DictReader(csv_data)
                     
                     for row in reader:
                         try:
@@ -124,9 +127,6 @@ class FnOTradingBot:
                                         break
                         except Exception as e:
                             continue
-                    
-                    csv_data_reset = response.text.split('\n')
-                    reader = csv.DictReader(csv_data_reset)
                 
                 logger.info(f"Total {len(self.security_id_map)} securities loaded")
                 return True
@@ -162,6 +162,8 @@ class FnOTradingBot:
                 "toDate": to_date.strftime("%Y-%m-%d")
             }
             
+            logger.info(f"📊 Fetching chart data for {symbol}...")
+            
             response = requests.post(
                 DHAN_INTRADAY_URL,
                 json=payload,
@@ -191,13 +193,17 @@ class FnOTradingBot:
                             'volume': volumes[i] if i < len(volumes) else 0
                         })
                     
-                    logger.info(f"{symbol}: Got {len(candles)} candles")
+                    logger.info(f"✅ {symbol}: Got {len(candles)} candles")
                     return candles
+                else:
+                    logger.warning(f"⚠️ {symbol}: Invalid data structure in response")
+            else:
+                logger.error(f"❌ {symbol}: API error {response.status_code}")
             
             return None
             
         except Exception as e:
-            logger.error(f"Error getting historical data for {symbol}: {e}")
+            logger.error(f"❌ Error getting historical data for {symbol}: {e}")
             return None
     
     def create_candlestick_chart(self, candles, symbol, spot_price):
@@ -219,7 +225,7 @@ class FnOTradingBot:
             df.set_index('Date', inplace=True)
             
             if len(df) < 2:
-                logger.warning(f"{symbol}: Not enough candles")
+                logger.warning(f"{symbol}: Not enough candles for chart")
                 return None
             
             mc = mpf.make_marketcolors(
@@ -275,10 +281,11 @@ class FnOTradingBot:
             buf.seek(0)
             plt.close(fig)
             
+            logger.info(f"✅ Chart created for {symbol}")
             return buf
             
         except Exception as e:
-            logger.error(f"Error creating chart for {symbol}: {e}")
+            logger.error(f"❌ Error creating chart for {symbol}: {e}")
             return None
     
     def get_nearest_expiry(self, security_id, segment):
@@ -288,6 +295,8 @@ class FnOTradingBot:
                 "UnderlyingScrip": security_id,
                 "UnderlyingSeg": segment
             }
+            
+            logger.info(f"📅 Fetching expiry dates...")
             
             response = requests.post(
                 DHAN_EXPIRY_LIST_URL,
@@ -301,12 +310,15 @@ class FnOTradingBot:
                 if data.get('status') == 'success' and data.get('data'):
                     expiries = data['data']
                     if expiries:
+                        logger.info(f"✅ Nearest expiry: {expiries[0]}")
                         return expiries[0]
+            else:
+                logger.error(f"❌ Expiry API error: {response.status_code}")
             
             return None
             
         except Exception as e:
-            logger.error(f"Error getting expiry: {e}")
+            logger.error(f"❌ Error getting expiry: {e}")
             return None
     
     def get_option_chain(self, security_id, segment, expiry):
@@ -318,6 +330,8 @@ class FnOTradingBot:
                 "Expiry": expiry
             }
             
+            logger.info(f"⛓️ Fetching option chain...")
+            
             response = requests.post(
                 DHAN_OPTION_CHAIN_URL,
                 json=payload,
@@ -328,12 +342,15 @@ class FnOTradingBot:
             if response.status_code == 200:
                 data = response.json()
                 if data.get('data'):
+                    logger.info(f"✅ Option chain loaded")
                     return data['data']
+            else:
+                logger.error(f"❌ Option chain API error: {response.status_code}")
             
             return None
             
         except Exception as e:
-            logger.error(f"Error getting option chain: {e}")
+            logger.error(f"❌ Error getting option chain: {e}")
             return None
     
     def pre_filter_stock(self, symbol, oc_data):
@@ -384,7 +401,7 @@ class FnOTradingBot:
             }
             
         except Exception as e:
-            logger.error(f"Pre-filter error for {symbol}: {e}")
+            logger.error(f"❌ Pre-filter error for {symbol}: {e}")
             return False, str(e)
     
     def format_option_data_for_ai(self, symbol, oc_data, spot_price):
@@ -434,7 +451,7 @@ class FnOTradingBot:
             return text
             
         except Exception as e:
-            logger.error(f"Error formatting option data: {e}")
+            logger.error(f"❌ Error formatting option data: {e}")
             return ""
     
     def format_candle_data_for_ai(self, candles):
@@ -458,7 +475,7 @@ class FnOTradingBot:
             return text
             
         except Exception as e:
-            logger.error(f"Error formatting candle data: {e}")
+            logger.error(f"❌ Error formatting candle data: {e}")
             return ""
     
     async def gemini_flash_scan(self, symbol, chart_buf, option_text, candle_text):
@@ -497,13 +514,14 @@ Respond in JSON format:
                 {"mime_type": "image/png", "data": image_bytes}
             ])
             
-            result = json.loads(response.text.replace('```json', '').replace('```', '').strip())
-            logger.info(f"✅ Gemini Flash: {symbol} - {result}")
+            result_text = response.text.replace('```json', '').replace('```', '').strip()
+            result = json.loads(result_text)
+            logger.info(f"✅ Gemini Flash: {symbol} - Tradeable: {result.get('tradeable')}")
             return result
             
         except Exception as e:
-            logger.error(f"Gemini Flash error for {symbol}: {e}")
-            return {"tradeable": False, "reason": str(e)}
+            logger.error(f"❌ Gemini Flash error for {symbol}: {e}")
+            return {"tradeable": False, "reason": str(e), "confidence": 0}
     
     async def gemini_pro_analyze(self, symbol, chart_buf, option_text, candle_text, flash_result):
         """Gemini Pro - Deep analysis"""
@@ -546,12 +564,13 @@ Respond in JSON format:
                 {"mime_type": "image/png", "data": image_bytes}
             ])
             
-            result = json.loads(response.text.replace('```json', '').replace('```', '').strip())
-            logger.info(f"✅ Gemini Pro: {symbol} - Entry @ {result.get('entry_price')}")
+            result_text = response.text.replace('```json', '').replace('```', '').strip()
+            result = json.loads(result_text)
+            logger.info(f"✅ Gemini Pro: {symbol} - Entry @ ₹{result.get('entry_price')}")
             return result
             
         except Exception as e:
-            logger.error(f"Gemini Pro error for {symbol}: {e}")
+            logger.error(f"❌ Gemini Pro error for {symbol}: {e}")
             return None
     
     async def gpt4o_validate(self, symbol, chart_buf, option_text, candle_text, gemini_result):
@@ -602,18 +621,20 @@ Respond in JSON format:
                 max_tokens=1000
             )
             
-            result = json.loads(response.choices[0].message.content.replace('```json', '').replace('```', '').strip())
+            result_text = response.choices[0].message.content.replace('```json', '').replace('```', '').strip()
+            result = json.loads(result_text)
             logger.info(f"✅ GPT-4o: {symbol} - Valid: {result.get('valid')}, Confidence: {result.get('confidence')}%")
             return result
             
         except Exception as e:
-            logger.error(f"GPT-4o error for {symbol}: {e}")
+            logger.error(f"❌ GPT-4o error for {symbol}: {e}")
             return None
     
     async def process_stock(self, symbol):
         """Complete pipeline for one stock"""
         try:
             if symbol not in self.security_id_map:
+                logger.warning(f"⚠️ {symbol} not found in security map")
                 return None
             
             info = self.security_id_map[symbol]
@@ -623,11 +644,13 @@ Respond in JSON format:
             # Get expiry
             expiry = self.get_nearest_expiry(security_id, segment)
             if not expiry:
+                logger.warning(f"⚠️ {symbol}: No expiry found")
                 return None
             
             # Get option chain
             oc_data = self.get_option_chain(security_id, segment, expiry)
             if not oc_data:
+                logger.warning(f"⚠️ {symbol}: No option chain data")
                 return None
             
             spot_price = oc_data.get('last_price', 0)
@@ -640,12 +663,14 @@ Respond in JSON format:
             
             # Get candles
             candles = self.get_historical_data(security_id, segment, symbol)
-            if not candles:
+            if not candles or len(candles) < 10:
+                logger.warning(f"⚠️ {symbol}: Insufficient candle data")
                 return None
             
             # Create chart
             chart_buf = self.create_candlestick_chart(candles, symbol, spot_price)
             if not chart_buf:
+                logger.warning(f"⚠️ {symbol}: Could not create chart")
                 return None
             
             # Format data for AI
@@ -661,6 +686,7 @@ Respond in JSON format:
             # Stage 2: Gemini Pro
             pro_result = await self.gemini_pro_analyze(symbol, chart_buf, option_text, candle_text, flash_result)
             if not pro_result:
+                logger.warning(f"⚠️ {symbol}: Gemini Pro analysis failed")
                 return None
             
             # Stage 3: GPT-4o
@@ -685,201 +711,5 @@ Respond in JSON format:
             return trade_signal
             
         except Exception as e:
-            logger.error(f"Error processing {symbol}: {e}")
+            logger.error(f"❌ Error processing {symbol}: {e}")
             return None
-    
-    async def send_trade_signal(self, trade):
-        """Send formatted trade signal to Telegram"""
-        try:
-            symbol = trade['symbol']
-            pro = trade['pro']
-            gpt = trade['gpt']
-            flash = trade['flash']
-            filter_data = trade['filter']
-            
-            msg = "┌─────────────────────────────────────────────┐\n"
-            msg += "│         🎯 F&O TRADE SIGNAL v2.0            │\n"
-            msg += "├─────────────────────────────────────────────┤\n\n"
-            
-            msg += f"📊 *{symbol}*\n"
-            msg += f"💰 Spot: ₹{trade['spot_price']:,.2f}\n"
-            msg += f"📅 Expiry: {trade['expiry']}\n\n"
-            
-            msg += "🎯 *ENTRY:*\n"
-            msg += f"   Strike: {pro.get('entry_strike', 'N/A')}\n"
-            msg += f"   Price: ₹{pro.get('entry_price', 0):.2f}\n\n"
-            
-            msg += "📈 *TARGETS & RISK:*\n"
-            msg += f"   Target: ₹{pro.get('target_price', 0):.2f}\n"
-            msg += f"   Stop Loss: ₹{pro.get('stop_loss', 0):.2f}\n"
-            msg += f"   R:R Ratio: 1:{pro.get('risk_reward', 0):.1f}\n\n"
-            
-            msg += "⏰ *TIME FRAME:*\n"
-            msg += f"   Exit by: {pro.get('exit_time', 'N/A')}\n\n"
-            
-            msg += "🔢 *OPTION METRICS:*\n"
-            msg += f"   Total OI: {filter_data.get('oi', 0)/1000:.0f}K\n"
-            msg += f"   PCR: {filter_data.get('pcr', 0):.2f}\n"
-            msg += f"   IV: {filter_data.get('iv', 0):.1f}%\n\n"
-            
-            msg += "🤖 *AI CONFIDENCE:*\n"
-            msg += f"   Gemini Flash: {flash.get('confidence', 0)}%\n"
-            msg += f"   Gemini Pro: {pro.get('confidence', 0)}%\n"
-            msg += f"   GPT-4o: {gpt.get('confidence', 0)}%\n"
-            avg_conf = (flash.get('confidence', 0) + pro.get('confidence', 0) + gpt.get('confidence', 0)) / 3
-            msg += f"   *Overall: {avg_conf:.0f}%*\n\n"
-            
-            msg += "📊 *PATTERN:*\n"
-            msg += f"   {flash.get('pattern', 'N/A')} - {flash.get('signal', 'N/A').upper()}\n\n"
-            
-            msg += "💡 *STRATEGY:*\n"
-            msg += f"   {pro.get('strategy', 'N/A')[:200]}...\n\n"
-            
-            msg += "✅ *GPT-4o VERDICT:*\n"
-            msg += f"   {gpt.get('final_verdict', 'N/A')}\n\n"
-            
-            msg += "└─────────────────────────────────────────────┘\n"
-            msg += f"⚡ Generated: {datetime.now().strftime('%I:%M %p')}"
-            
-            # Send chart first
-            trade['chart'].seek(0)
-            await self.bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=trade['chart'],
-                caption=f"📊 {symbol} - Technical Chart"
-            )
-            
-            await asyncio.sleep(1)
-            
-            # Send trade signal
-            await self.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=msg,
-                parse_mode='Markdown'
-            )
-            
-            logger.info(f"✅ Trade signal sent for {symbol}")
-            
-        except Exception as e:
-            logger.error(f"Error sending trade signal: {e}")
-    
-    async def scan_all_stocks(self):
-        """Scan all stocks through the pipeline"""
-        logger.info("\n" + "="*60)
-        logger.info("🚀 STARTING MULTI-AI SCAN PIPELINE")
-        logger.info("="*60 + "\n")
-        
-        trade_signals = []
-        
-        for symbol in self.security_id_map.keys():
-            logger.info(f"\n{'─'*60}")
-            logger.info(f"📡 Processing: {symbol}")
-            logger.info(f"{'─'*60}")
-            
-            trade = await self.process_stock(symbol)
-            
-            if trade:
-                trade_signals.append(trade)
-                await self.send_trade_signal(trade)
-                await asyncio.sleep(2)  # Delay between signals
-            
-            # Delay between stocks to avoid rate limits
-            await asyncio.sleep(5)
-        
-        logger.info(f"\n{'='*60}")
-        logger.info(f"✅ SCAN COMPLETE: {len(trade_signals)} Trade Signals Generated")
-        logger.info(f"{'='*60}\n")
-        
-        return trade_signals
-    
-    async def run(self):
-        """Main loop"""
-        logger.info("🚀 F&O Trading Bot v2.0 Started!")
-        
-        # Load security IDs
-        success = await self.load_security_ids()
-        if not success:
-            logger.error("Failed to load security IDs. Exiting...")
-            return
-        
-        await self.send_startup_message()
-        
-        while self.running:
-            try:
-                current_time = datetime.now()
-                hour = current_time.hour
-                minute = current_time.minute
-                
-                # Run only during market hours (9:15 AM - 3:30 PM)
-                if 9 <= hour < 15 or (hour == 15 and minute <= 30):
-                    logger.info(f"\n⏰ Scan cycle started at {current_time.strftime('%I:%M %p')}")
-                    
-                    # Run scan
-                    await self.scan_all_stocks()
-                    
-                    logger.info("\n⏳ Waiting 15 minutes for next scan...")
-                    await asyncio.sleep(900)  # 15 minutes
-                else:
-                    logger.info("🌙 Outside market hours. Waiting...")
-                    await asyncio.sleep(1800)  # Wait 30 min
-                
-            except KeyboardInterrupt:
-                logger.info("Bot stopped by user")
-                self.running = False
-                break
-            except Exception as e:
-                logger.error(f"Error in main loop: {e}")
-                await asyncio.sleep(60)
-    
-    async def send_startup_message(self):
-        """Send startup message"""
-        try:
-            msg = "┌─────────────────────────────────────────────┐\n"
-            msg += "│         🚀 F&O TRADING BOT v2.0             │\n"
-            msg += "├─────────────────────────────────────────────┤\n\n"
-            msg += f"📊 Tracking: {len(self.security_id_map)} stocks/indices\n"
-            msg += "⏱️ Scan cycle: Every 15 minutes\n\n"
-            msg += "🤖 *AI Pipeline:*\n"
-            msg += "   1️⃣ Pre-Filter (OI, PCR, IV)\n"
-            msg += "   2️⃣ Gemini Flash (Pattern scan)\n"
-            msg += "   3️⃣ Gemini Pro (Strategy)\n"
-            msg += "   4️⃣ GPT-4o (Validation)\n\n"
-            msg += "✅ Bot is LIVE!\n"
-            msg += "🕒 Market Hours: 9:15 AM - 3:30 PM\n\n"
-            msg += "└─────────────────────────────────────────────┘"
-            
-            await self.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=msg,
-                parse_mode='Markdown'
-            )
-            logger.info("Startup message sent")
-        except Exception as e:
-            logger.error(f"Error sending startup message: {e}")
-
-
-# ========================
-# RUN BOT
-# ========================
-if __name__ == "__main__":
-    try:
-        # Check environment variables
-        required_vars = [
-            TELEGRAM_BOT_TOKEN, 
-            TELEGRAM_CHAT_ID, 
-            DHAN_CLIENT_ID, 
-            DHAN_ACCESS_TOKEN,
-            GEMINI_API_KEY,
-            OPENAI_API_KEY
-        ]
-        
-        if not all(required_vars):
-            logger.error("❌ Missing environment variables!")
-            logger.error("Required: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, GEMINI_API_KEY, OPENAI_API_KEY")
-            exit(1)
-        
-        bot = FnOTradingBot()
-        asyncio.run(bot.run())
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        exit(1)
