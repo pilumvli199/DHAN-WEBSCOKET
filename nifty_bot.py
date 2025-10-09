@@ -154,8 +154,10 @@ class DhanOptionChainBot:
             return False
     
     def get_historical_data(self, security_id, segment, symbol):
-        """Last 199 candles (5 min timeframe) चा historical data घेतो"""
+        """Last 5 days चे 5-minute candles घेतो (~375 candles)"""
         try:
+            from datetime import datetime, timedelta
+            
             # Exchange segment निवडतो
             if segment == "IDX_I":
                 exch_seg = "IDX_I"
@@ -164,12 +166,18 @@ class DhanOptionChainBot:
                 exch_seg = "NSE_EQ"
                 instrument = "EQUITY"
             
-            # Intraday API साठी payload (5 min candles)
+            # Last 5 trading days साठी dates
+            to_date = datetime.now()
+            from_date = to_date - timedelta(days=7)  # 7 days back to ensure 5 trading days
+            
+            # Intraday API साठी payload (5 min candles with date range)
             payload = {
                 "securityId": str(security_id),
                 "exchangeSegment": exch_seg,
                 "instrument": instrument,
-                "interval": "5"  # 5 minute candles
+                "interval": "5",  # 5 minute candles
+                "fromDate": from_date.strftime("%Y-%m-%d"),
+                "toDate": to_date.strftime("%Y-%m-%d")
             }
             
             logger.info(f"Intraday API call for {symbol}: {payload}")
@@ -195,6 +203,8 @@ class DhanOptionChainBot:
                     volumes = data.get('volume', [])
                     timestamps = data.get('start_Time', [])
                     
+                    logger.info(f"{symbol}: Total arrays length - Open:{len(opens)}, Time:{len(timestamps)}")
+                    
                     # Candles तयार करतो
                     candles = []
                     for i in range(len(opens)):
@@ -209,7 +219,7 @@ class DhanOptionChainBot:
                     
                     # Last 199 candles घेतो
                     result = candles[-199:] if len(candles) > 199 else candles
-                    logger.info(f"{symbol}: Got {len(result)} candles (5 min)")
+                    logger.info(f"{symbol}: Got {len(result)} candles from last 5 days (5 min)")
                     return result
                 else:
                     logger.warning(f"{symbol}: Invalid response format - {str(data)[:200]}")
