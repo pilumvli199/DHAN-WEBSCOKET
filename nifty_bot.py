@@ -15,6 +15,8 @@ import mplfinance as mpf
 import pandas as pd
 import google.generativeai as genai
 from openai import OpenAI
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Logging setup
 logging.basicConfig(
