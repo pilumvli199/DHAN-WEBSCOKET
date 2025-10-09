@@ -154,7 +154,7 @@ class DhanOptionChainBot:
             return False
     
     def get_historical_data(self, security_id, segment, symbol):
-        """Last 5 days चे 5-minute candles घेतो (~375 candles)"""
+        """Last 5 days चे सर्व 5-minute candles घेतो"""
         try:
             from datetime import datetime, timedelta
             
@@ -217,10 +217,9 @@ class DhanOptionChainBot:
                             'volume': volumes[i] if i < len(volumes) else 0
                         })
                     
-                    # Last 199 candles घेतो
-                    result = candles[-199:] if len(candles) > 199 else candles
-                    logger.info(f"{symbol}: Got {len(result)} candles from last 5 days (5 min)")
-                    return result
+                    # सर्व available candles return करतो (no limit!)
+                    logger.info(f"{symbol}: Returning ALL {len(candles)} candles from last 5 days (5 min)")
+                    return candles
                 else:
                     logger.warning(f"{symbol}: Invalid response format - {str(data)[:200]}")
                     return None
