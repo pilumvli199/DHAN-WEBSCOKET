@@ -35,6 +35,7 @@ DHAN_OPTION_CHAIN_URL = f"{DHAN_API_BASE}/v2/optionchain"
 DHAN_EXPIRY_LIST_URL = f"{DHAN_API_BASE}/v2/optionchain/expirylist"
 DHAN_INSTRUMENTS_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 DHAN_HISTORICAL_URL = f"{DHAN_API_BASE}/v2/charts/historical"
+DHAN_INTRADAY_URL = f"{DHAN_API_BASE}/v2/charts/intraday"
 
 # Stock/Index List - Symbol mapping
 STOCKS_INDICES = {
@@ -153,14 +154,8 @@ class DhanOptionChainBot:
             return False
     
     def get_historical_data(self, security_id, segment, symbol):
-        """Last 199 candles चा historical data घेतो"""
+        """Last 199 candles (5 min timeframe) चा historical data घेतो"""
         try:
-            from datetime import datetime, timedelta
-            
-            # Dates calculate करतो (last 200 trading days ~= 10 months)
-            to_date = datetime.now()
-            from_date = to_date - timedelta(days=300)  # 300 days back
-            
             # Exchange segment निवडतो
             if segment == "IDX_I":
                 exch_seg = "IDX_I"
@@ -169,38 +164,58 @@ class DhanOptionChainBot:
                 exch_seg = "NSE_EQ"
                 instrument = "EQUITY"
             
+            # Intraday API साठी payload (5 min candles)
             payload = {
                 "securityId": str(security_id),
                 "exchangeSegment": exch_seg,
                 "instrument": instrument,
-                "expiryCode": 0,
-                "fromDate": from_date.strftime("%Y-%m-%d"),
-                "toDate": to_date.strftime("%Y-%m-%d")
+                "interval": "5"  # 5 minute candles
             }
             
-            logger.info(f"Historical API call for {symbol}: {payload}")
+            logger.info(f"Intraday API call for {symbol}: {payload}")
             
             response = requests.post(
-                DHAN_HISTORICAL_URL,
+                DHAN_INTRADAY_URL,
                 json=payload,
                 headers=self.headers,
                 timeout=15
             )
             
-            logger.info(f"{symbol} Historical response status: {response.status_code}")
+            logger.info(f"{symbol} Intraday response status: {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
-                logger.info(f"{symbol} Historical response: {str(data)[:200]}")
                 
-                if data.get('data'):
-                    candles = data['data']
+                # Response format: {"open": [...], "high": [...], "low": [...], "close": [...], "volume": [...], "start_Time": [...]}
+                if 'open' in data and 'high' in data and 'low' in data and 'close' in data:
+                    opens = data.get('open', [])
+                    highs = data.get('high', [])
+                    lows = data.get('low', [])
+                    closes = data.get('close', [])
+                    volumes = data.get('volume', [])
+                    timestamps = data.get('start_Time', [])
+                    
+                    # Candles तयार करतो
+                    candles = []
+                    for i in range(len(opens)):
+                        candles.append({
+                            'timestamp': timestamps[i] if i < len(timestamps) else '',
+                            'open': opens[i] if i < len(opens) else 0,
+                            'high': highs[i] if i < len(highs) else 0,
+                            'low': lows[i] if i < len(lows) else 0,
+                            'close': closes[i] if i < len(closes) else 0,
+                            'volume': volumes[i] if i < len(volumes) else 0
+                        })
+                    
                     # Last 199 candles घेतो
                     result = candles[-199:] if len(candles) > 199 else candles
-                    logger.info(f"{symbol}: Got {len(result)} candles")
+                    logger.info(f"{symbol}: Got {len(result)} candles (5 min)")
                     return result
+                else:
+                    logger.warning(f"{symbol}: Invalid response format - {str(data)[:200]}")
+                    return None
             
-            logger.warning(f"{symbol}: Historical data नाही मिळाला - Response: {response.text[:200]}")
+            logger.warning(f"{symbol}: Historical data नाही मिळाला - Status: {response.status_code}")
             return None
             
         except Exception as e:
