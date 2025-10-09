@@ -18,7 +18,6 @@ import matplotlib
 matplotlib.use('Agg')
 import mplfinance as mpf
 import google.generativeai as genai
-from openai import OpenAI
 
 # Force stdout flush for deployment logs (like Railway)
 sys.stdout.reconfigure(line_buffering=True)
@@ -42,25 +41,22 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # This is optional as we removed GPT-4o
 
 # AI Setup
 try:
     genai.configure(api_key=GEMINI_API_KEY)
 except Exception as e:
     logger.critical(f"❌ Failed to configure AI clients: {e}")
-    sys.exit(1) # Exit if AI keys are not set
+    sys.exit(1)
 
 # Dhan API URLs
 DHAN_API_BASE = "https://api.dhan.co"
 DHAN_INTRADAY_URL = f"{DHAN_API_BASE}/v2/charts/intraday"
-DHAN_OPTION_CHAIN_URL = f"{DHAN_API_BASE}/v2/optionchain" # Correct URL from logs
+DHAN_OPTION_CHAIN_URL = f"{DHAN_API_BASE}/v2/optionchain"
 DHAN_INSTRUMENTS_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
-# Stock/Index Watchlist
+# =================== FIX 1: REMOVED INDICES, FOCUS ON STOCKS ===================
 STOCKS_INDICES = {
-    "NIFTY": {"symbol": "Nifty 50", "segment": "IDX_I", "search_variants": ["NIFTY 50", "Nifty 50", "NIFTY"]},
-    "BANKNIFTY": {"symbol": "Nifty Bank", "segment": "IDX_I", "search_variants": ["NIFTY BANK", "Nifty Bank", "BANKNIFTY"]},
     "RELIANCE": {"symbol": "RELIANCE", "segment": "NSE_EQ", "search_variants": ["RELIANCE"]},
     "HDFCBANK": {"symbol": "HDFCBANK", "segment": "NSE_EQ", "search_variants": ["HDFCBANK"]},
     "ICICIBANK": {"symbol": "ICICIBANK", "segment": "NSE_EQ", "search_variants": ["ICICIBANK"]},
@@ -87,14 +83,12 @@ class FnOTradingBot:
         }
         self.security_id_map = {}
         
-        # Initialize AI Models
         self.gemini_flash = genai.GenerativeModel('gemini-1.5-flash')
         self.gemini_pro = genai.GenerativeModel('gemini-1.5-pro')
         
         logger.info("🚀 F&O Trading Bot v2.0 initialized")
     
     async def load_security_ids(self):
-        """Loads security IDs from Dhan's master CSV file."""
         try:
             logger.info("Downloading Dhan instruments master file...")
             response = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
@@ -106,62 +100,44 @@ class FnOTradingBot:
             all_rows = list(reader)
             
             for symbol, info in STOCKS_INDICES.items():
-                segment_code = 'I' if info['segment'] == 'IDX_I' else 'E'
-                search_variants = info['search_variants']
-                
                 found = False
                 for row in all_rows:
                     try:
-                        is_match = False
-                        if segment_code == 'I' and row.get('SEM_SEGMENT') == 'I':
-                            if row.get('SEM_TRADING_SYMBOL') in search_variants:
-                                is_match = True
-                        elif segment_code == 'E' and row.get('SEM_SEGMENT') == 'E':
-                            if row.get('SEM_TRADING_SYMBOL') in search_variants and row.get('SEM_EXM_EXCH_ID') == 'NSE':
-                                is_match = True
-                        
-                        if is_match:
+                        if (row.get('SEM_SEGMENT') == 'E' and
+                            row.get('SEM_TRADING_SYMBOL') in info['search_variants'] and
+                            row.get('SEM_EXM_EXCH_ID') == 'NSE'):
+                            
                             sec_id = row.get('SEM_SMST_SECURITY_ID')
-                            trading_symbol = row.get('SEM_TRADING_SYMBOL')
                             if sec_id:
                                 self.security_id_map[symbol] = {
                                     'security_id': int(sec_id),
-                                    'segment': info['segment'],
-                                    'trading_symbol': trading_symbol
+                                    'segment': info['segment']
                                 }
-                                logger.info(f"✅ {symbol}: Security ID = {sec_id} (Found as: {trading_symbol})")
+                                logger.info(f"✅ {symbol}: Security ID = {sec_id}")
                                 found = True
                                 break
                     except (ValueError, TypeError):
                         continue
                 
                 if not found:
-                    logger.warning(f"⚠️ {symbol}: Not found in CSV (tried variants: {search_variants})")
+                    logger.warning(f"⚠️ {symbol}: Not found in CSV")
 
             logger.info(f"Total {len(self.security_id_map)} securities loaded.")
             return True
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to download instruments file: {e}")
-            return False
         except Exception as e:
-            logger.error(f"Error loading security IDs: {e}")
+            logger.error(f"Error loading security IDs: {e}", exc_info=True)
             return False
 
-    def get_historical_data(self, security_id, segment, symbol):
-        """Fetches historical intraday data for the last few days."""
+    def get_historical_data(self, security_id, symbol):
         try:
-            exch_seg = "IDX" if segment == "IDX_I" else "NSE_EQ"
-            instrument_type = "INDEX" if segment == "IDX_I" else "EQUITY"
-            
             to_date = datetime.now()
             from_date = to_date - timedelta(days=7)
             
             payload = {
                 "securityId": str(security_id),
-                "exchangeSegment": exch_seg,
-                "instrument": instrument_type,
-                "expiryDate": "0",
+                "exchangeSegment": "NSE_EQ",
+                "instrument": "EQUITY",
                 "fromDate": from_date.strftime("%Y-%m-%d"),
                 "toDate": to_date.strftime("%Y-%m-%d"),
                 "interval": "FIVE_MINUTE"
@@ -176,10 +152,8 @@ class FnOTradingBot:
                 candle_data = data['data']
                 df = pd.DataFrame({
                     'Date': pd.to_datetime(candle_data['start_Time'], unit='s'),
-                    'Open': candle_data['open'],
-                    'High': candle_data['high'],
-                    'Low': candle_data['low'],
-                    'Close': candle_data['close'],
+                    'Open': candle_data['open'], 'High': candle_data['high'],
+                    'Low': candle_data['low'], 'Close': candle_data['close'],
                     'Volume': candle_data['volume']
                 })
                 logger.info(f"✅ {symbol}: Got {len(df)} candles")
@@ -192,54 +166,37 @@ class FnOTradingBot:
             return None
 
     def create_candlestick_chart(self, df, symbol, spot_price):
-        """Creates a candlestick chart image from a pandas DataFrame."""
         try:
-            if df is None or len(df) < 2:
-                logger.warning(f"{symbol}: Not enough data for chart.")
-                return None
-
+            if df is None or len(df) < 2: return None
             df_chart = df.copy()
             df_chart.set_index('Date', inplace=True)
             
             mc = mpf.make_marketcolors(up='#26a69a', down='#ef5350', inherit=True)
             s = mpf.make_mpf_style(marketcolors=mc, base_mpf_style='nightclouds')
 
-            fig, axes = mpf.plot(
-                df_chart.tail(150),
-                type='candle',
-                style=s,
-                volume=True,
-                title=f'\n{symbol} | Spot: ₹{spot_price:,.2f}',
-                ylabel='Price (₹)',
-                figsize=(15, 8),
-                returnfig=True,
-                tight_layout=True
+            fig, _ = mpf.plot(
+                df_chart.tail(150), type='candle', style=s, volume=True,
+                title=f'\n{symbol} | Spot: ₹{spot_price:,.2f}', ylabel='Price (₹)',
+                figsize=(15, 8), returnfig=True, tight_layout=True
             )
             
             buf = io.BytesIO()
             fig.savefig(buf, format='png', dpi=100)
             buf.seek(0)
-            
             logger.info(f"✅ Chart created for {symbol}")
             return buf
         except Exception as e:
             logger.error(f"❌ Error creating chart for {symbol}: {e}")
             return None
 
-    # ============== THIS IS THE CORRECTED FUNCTION ==============
-    def get_option_chain(self, security_id, segment, symbol):
-        """Fetches the full option chain for a given security."""
+    def get_option_chain(self, security_id, symbol):
         try:
-            payload = {
-                "securityId": str(security_id),
-                "exchangeSegment": "NSE_FNO" # Option chain is in FNO segment
-            }
+            payload = {"securityId": str(security_id), "exchangeSegment": "NSE_FNO"}
             logger.info(f"⛓️ Fetching option chain for {symbol}...")
-            # THE FIX: Changed from requests.get to requests.post and params to json
             response = requests.post(DHAN_OPTION_CHAIN_URL, json=payload, headers=self.headers, timeout=15)
             response.raise_for_status()
-
             data = response.json()
+
             if data.get('status') == 'success' and 'data' in data:
                 logger.info(f"✅ Option chain loaded for {symbol}")
                 return data['data']
@@ -251,50 +208,25 @@ class FnOTradingBot:
             return None
 
     def pre_filter_stock(self, symbol, oc_data):
-        """Pre-filters the stock based on OI, PCR, and IV."""
         try:
-            if not oc_data:
-                return False, "No option chain data"
+            if not oc_data: return False, "No option chain data"
             
             spot_price = oc_data.get('spotPrice', 0)
             total_ce_oi = oc_data.get('totalCE_OI', 0)
             total_pe_oi = oc_data.get('totalPE_OI', 0)
 
-            if total_ce_oi == 0 or total_pe_oi == 0:
-                return False, "OI data is zero"
+            if total_ce_oi == 0 or total_pe_oi == 0: return False, "OI data is zero"
 
             pcr = total_pe_oi / total_ce_oi
-            if not (0.7 <= pcr <= 1.5):
-                return False, f"PCR out of range: {pcr:.2f}"
+            if not (0.7 <= pcr <= 1.5): return False, f"PCR out of range: {pcr:.2f}"
             
-            all_strikes = [d['strikePrice'] for d in oc_data.get('optionChainDetails', [])]
-            if not all_strikes:
-                return False, "No strikes found in option chain"
-            
-            atm_strike = min(all_strikes, key=lambda x: abs(x - spot_price))
-            
-            avg_iv = 0
-            count = 0
-            for details in oc_data.get('optionChainDetails', []):
-                if abs(details['strikePrice'] - atm_strike) <= 200:
-                    if details.get('ce_impledVolatility', 0) > 0:
-                        avg_iv += details['ce_impledVolatility']
-                        count += 1
-            if count > 0:
-                avg_iv /= count
-            
-            if avg_iv > 50:
-                 return False, f"High IV: {avg_iv:.1f}%"
-            
-            logger.info(f"✅ {symbol} PASSED pre-filter: PCR={pcr:.2f}, IV={avg_iv:.1f}%")
-            return True, {'pcr': pcr, 'iv': avg_iv, 'atm_strike': atm_strike}
-
+            logger.info(f"✅ {symbol} PASSED pre-filter: PCR={pcr:.2f}")
+            return True, {'pcr': pcr}
         except Exception as e:
             logger.error(f"❌ Pre-filter error for {symbol}: {e}")
             return False, str(e)
 
     def format_data_for_ai(self, symbol, oc_data, df):
-        """Formats option chain and candle data into a single text block for AI analysis."""
         try:
             spot_price = oc_data.get('spotPrice', 0)
             atm_strike = min([d['strikePrice'] for d in oc_data['optionChainDetails']], key=lambda x: abs(x - spot_price))
@@ -307,13 +239,13 @@ class FnOTradingBot:
             text += "-" * 55 + "\n"
 
             for detail in sorted(oc_data['optionChainDetails'], key=lambda x: x['strikePrice']):
-                if abs(detail['strikePrice'] - atm_strike) <= 300 * (1 if 'BANK' in symbol or 'NIFTY' in symbol else 2):
+                if abs(detail['strikePrice'] - atm_strike) <= (atm_strike * 0.05): # 5% range around ATM
                     strike = detail['strikePrice']
-                    ce_ltp = detail.get('ce_lastPrice', 0)
-                    ce_oi = detail.get('ce_openInterest', 0) / 100000
-                    pe_ltp = detail.get('pe_lastPrice', 0)
-                    pe_oi = detail.get('pe_openInterest', 0) / 100000
-                    text += f"{strike:<6.0f} | {ce_ltp:<6.2f} | {ce_oi:<15.2f} | {pe_ltp:<6.2f} | {pe_oi:<15.2f}\n"
+                    text += (f"{strike:<6.0f} | "
+                             f"{detail.get('ce_lastPrice', 0):<6.2f} | "
+                             f"{detail.get('ce_openInterest', 0) / 100000:<15.2f} | "
+                             f"{detail.get('pe_lastPrice', 0):<6.2f} | "
+                             f"{detail.get('pe_openInterest', 0) / 100000:<15.2f}\n")
 
             text += "\n--- RECENT PRICE ACTION (Last 15 Candles) ---\n"
             text += "Time (IST)        | Open   | High   | Low    | Close  | Volume\n"
@@ -328,138 +260,92 @@ class FnOTradingBot:
             return "Error formatting data."
 
     async def run_ai_analysis(self, model, symbol, chart_buf, formatted_text, prompt):
-        """Generic function to run analysis on a specific AI model."""
         try:
             chart_buf.seek(0)
             image_bytes = chart_buf.read()
-            
             logger.info(f"🧠 Running {model.model_name.split('/')[-1]} analysis for {symbol}...")
-            
-            response = await model.generate_content_async([
-                prompt,
-                formatted_text,
-                {"mime_type": "image/png", "data": image_bytes}
-            ])
-            
+            response = await model.generate_content_async([prompt, formatted_text, {"mime_type": "image/png", "data": image_bytes}])
             result_text = response.text.strip().replace('```json', '').replace('```', '')
-            result = json.loads(result_text)
-            return result
+            return json.loads(result_text)
         except Exception as e:
             logger.error(f"❌ AI analysis error ({model.model_name}) for {symbol}: {e}")
             return None
 
     async def send_trade_alert(self, trade_signal):
-        """Formats and sends the final trade signal to Telegram."""
         try:
             symbol = trade_signal['symbol']
             pro_result = trade_signal['pro']
             chart_buf = trade_signal['chart']
             
-            caption = f"🚨 **Trade Alert: {symbol}** 🚨\n\n"
-            caption += f"**Signal:** {pro_result.get('signal', 'N/A').upper()}\n"
-            caption += f"**Entry Option:** {pro_result.get('entry_option', 'N/A')}\n"
-            caption += f"**Entry Price:** ₹{pro_result.get('entry_price', 0):.2f}\n"
-            caption += f"**Target:** ₹{pro_result.get('target_price', 0):.2f}\n"
-            caption += f"**Stop Loss:** ₹{pro_result.get('stop_loss', 0):.2f}\n"
-            caption += f"**Risk:Reward:** {pro_result.get('risk_reward', 'N/A')}\n\n"
-            caption += f"**Confidence:** {pro_result.get('confidence', 0)}%\n\n"
-            caption += f"**Strategy:**\n_{pro_result.get('strategy', 'Not available.')}_"
+            caption = (f"🚨 **Trade Alert: {symbol}** 🚨\n\n"
+                       f"**Signal:** {pro_result.get('signal', 'N/A').upper()}\n"
+                       f"**Entry Option:** {pro_result.get('entry_option', 'N/A')}\n"
+                       f"**Entry Price:** ₹{pro_result.get('entry_price', 0):.2f}\n"
+                       f"**Target:** ₹{pro_result.get('target_price', 0):.2f}\n"
+                       f"**Stop Loss:** ₹{pro_result.get('stop_loss', 0):.2f}\n"
+                       f"**Risk:Reward:** {pro_result.get('risk_reward', 'N/A')}\n\n"
+                       f"**Confidence:** {pro_result.get('confidence', 0)}%\n\n"
+                       f"**Strategy:**\n_{pro_result.get('strategy', 'Not available.')}_")
             
             chart_buf.seek(0)
-            await self.bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=chart_buf,
-                caption=caption,
-                parse_mode='Markdown'
-            )
+            await self.bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=chart_buf, caption=caption, parse_mode='Markdown')
             logger.info(f"✅ Trade alert sent to Telegram for {symbol}")
-            
         except Exception as e:
             logger.error(f"❌ Failed to send Telegram alert for {symbol}: {e}")
 
     async def process_stock(self, symbol):
-        """Runs the complete analysis pipeline for a single stock."""
         try:
-            if symbol not in self.security_id_map:
-                logger.warning(f"Skipping {symbol}, not found in security map.")
-                return
-
+            if symbol not in self.security_id_map: return
             info = self.security_id_map[symbol]
             security_id = info['security_id']
-            segment = info['segment']
             
-            oc_data = self.get_option_chain(security_id, segment, symbol)
-            if not oc_data:
-                return
+            oc_data = self.get_option_chain(security_id, symbol)
+            if not oc_data: return
             
             passed, filter_reason = self.pre_filter_stock(symbol, oc_data)
             if not passed:
                 logger.info(f"➡️ {symbol} filtered out: {filter_reason}")
                 return
             
-            spot_price = oc_data.get('spotPrice', 0)
-
-            df = self.get_historical_data(security_id, segment, symbol)
+            df = self.get_historical_data(security_id, symbol)
             if df is None or len(df) < 50:
-                logger.warning(f"⚠️ {symbol}: Insufficient candle data ({len(df) if df is not None else 0})")
+                logger.warning(f"⚠️ {symbol}: Insufficient candle data.")
                 return
 
-            chart_buf = self.create_candlestick_chart(df, symbol, spot_price)
+            chart_buf = self.create_candlestick_chart(df, symbol, oc_data.get('spotPrice', 0))
             if not chart_buf: return
 
             formatted_text = self.format_data_for_ai(symbol, oc_data, df)
             
-            flash_prompt = """
-            Analyze the provided chart, option chain, and candle data for a quick trading opportunity.
-            Respond in JSON with: {"tradeable": boolean, "signal": "bullish/bearish/neutral", "reason": "brief reason"}
-            """
+            flash_prompt = 'Analyze for a trade. Respond in JSON: {"tradeable": boolean, "signal": "bullish/bearish/neutral", "reason": "brief reason"}'
             flash_result = await self.run_ai_analysis(self.gemini_flash, symbol, chart_buf, formatted_text, flash_prompt)
             if not flash_result or not flash_result.get('tradeable'):
                 logger.info(f"➡️ {symbol} not tradeable per Gemini Flash.")
                 return
 
-            pro_prompt = f"""
-            Gemini Flash found a '{flash_result.get('signal')}' signal. Now, create a precise F&O trade plan.
-            Analyze all data and respond in JSON with:
-            {{
-                "signal": "bullish/bearish",
-                "entry_option": "e.g., 22500 CE or 22400 PE",
-                "entry_price": float,
-                "target_price": float,
-                "stop_loss": float,
-                "risk_reward": "e.g., 1:2.5",
-                "confidence": integer (0-100),
-                "strategy": "Detailed step-by-step strategy and reasoning."
-            }}
-            """
+            pro_prompt = f'Flash found a "{flash_result.get("signal")}" signal. Create a precise F&O trade plan. Respond in JSON with: {{"signal": "...", "entry_option": "...", "entry_price": float, "target_price": float, "stop_loss": float, "risk_reward": "...", "confidence": integer, "strategy": "..."}}'
             pro_result = await self.run_ai_analysis(self.gemini_pro, symbol, chart_buf, formatted_text, pro_prompt)
             if not pro_result or pro_result.get('confidence', 0) < 65:
-                logger.info(f"➡️ {symbol} rejected by Gemini Pro due to low confidence.")
+                logger.info(f"➡️ {symbol} rejected by Gemini Pro (Confidence: {pro_result.get('confidence', 0)}%).")
                 return
                 
-            trade_signal = {
-                'symbol': symbol,
-                'pro': pro_result,
-                'chart': chart_buf
-            }
+            trade_signal = {'symbol': symbol, 'pro': pro_result, 'chart': chart_buf}
             logger.info(f"🎯🎯🎯 {symbol} TRADE SIGNAL GENERATED! 🎯🎯🎯")
             await self.send_trade_alert(trade_signal)
-
         except Exception as e:
             logger.error(f"❌ FATAL error processing {symbol}: {e}", exc_info=True)
 
 # ========================
-# HTTP SERVER FOR DEPLOYMENT
+# HTTP SERVER & MAIN EXECUTION
 # ========================
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Bot is alive and running!")
+        self.wfile.write(b"Bot is alive!")
 
 def run_server():
-    """Runs a simple HTTP server to keep the bot alive on deployment platforms."""
     port = int(os.environ.get("PORT", 8080))
     server_address = ('', port)
     try:
@@ -469,40 +355,30 @@ def run_server():
     except Exception as e:
         logger.critical(f"Could not start HTTP server: {e}")
 
-# ========================
-# MAIN EXECUTION
-# ========================
 async def main():
-    """Main function to initialize and run the bot."""
     if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, GEMINI_API_KEY]):
-        logger.critical("❌ Missing one or more critical environment variables. Exiting.")
+        logger.critical("❌ Missing critical environment variables. Exiting.")
         return
 
     server_thread = Thread(target=run_server, daemon=True)
     server_thread.start()
-
     bot_instance = FnOTradingBot()
     
     if await bot_instance.load_security_ids():
-        await bot_instance.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text="✅ **F&O Trading Bot v2.0 is ONLINE**\nInitializing first scan cycle...",
-            parse_mode='Markdown'
-        )
+        await bot_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="✅ **Bot is ONLINE**\nStarting scan cycle...", parse_mode='Markdown')
 
+        # =================== FIX 2: SEQUENTIAL LOOP WITH DELAY ===================
         while bot_instance.running:
             logger.info("============== NEW SCAN CYCLE ==============")
-            tasks = [bot_instance.process_stock(stock) for stock in STOCKS_INDICES.keys()]
-            await asyncio.gather(*tasks)
+            for stock_symbol in STOCKS_INDICES.keys():
+                await bot_instance.process_stock(stock_symbol)
+                logger.info(f"--- Waiting 1 second before next stock ---")
+                await asyncio.sleep(1) # Delay to respect API rate limits
             
             logger.info(f"Scan cycle complete. Waiting for 5 minutes...")
             await asyncio.sleep(300)
     else:
-        await bot_instance.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text="❌ **Bot failed to start.**\nCould not load security IDs from Dhan. Check logs.",
-            parse_mode='Markdown'
-        )
+        await bot_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="❌ **Bot failed to start.** Check logs.", parse_mode='Markdown')
 
 if __name__ == '__main__':
     try:
