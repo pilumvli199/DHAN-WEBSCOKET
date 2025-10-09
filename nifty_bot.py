@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 from telegram import Bot
 import requests
 from datetime import datetime
@@ -18,12 +19,23 @@ from openai import OpenAI
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# Force stdout flush for Railway logs
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 # Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    stream=sys.stdout,
+    force=True
 )
 logger = logging.getLogger(__name__)
+
+# Also log to stderr
+console_handler = logging.StreamHandler(sys.stderr)
+console_handler.setLevel(logging.INFO)
+logger.addHandler(console_handler)
 
 # ========================
 # CONFIGURATION
