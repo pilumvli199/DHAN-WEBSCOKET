@@ -42,12 +42,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # This is optional as we removed GPT-4o
 
 # AI Setup
 try:
     genai.configure(api_key=GEMINI_API_KEY)
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
 except Exception as e:
     logger.critical(f"❌ Failed to configure AI clients: {e}")
     sys.exit(1) # Exit if AI keys are not set
@@ -55,8 +54,7 @@ except Exception as e:
 # Dhan API URLs
 DHAN_API_BASE = "https://api.dhan.co"
 DHAN_INTRADAY_URL = f"{DHAN_API_BASE}/v2/charts/intraday"
-DHAN_OPTION_CHAIN_URL = f"{DHAN_API_BASE}/v2/optionchain"
-DHAN_EXPIRY_LIST_URL = f"{DHAN_API_BASE}/v2/optionchain/expirylist"
+DHAN_OPTION_CHAIN_URL = f"{DHAN_API_BASE}/v2/optionchain" # Correct URL from logs
 DHAN_INSTRUMENTS_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
 # Stock/Index Watchlist
@@ -100,12 +98,12 @@ class FnOTradingBot:
         try:
             logger.info("Downloading Dhan instruments master file...")
             response = requests.get(DHAN_INSTRUMENTS_URL, timeout=30)
-            response.raise_for_status()  # Raise an exception for bad status codes
+            response.raise_for_status()
             
             csv_text = response.text
             reader = csv.DictReader(io.StringIO(csv_text))
             
-            all_rows = list(reader) # Read all rows into memory for faster searching
+            all_rows = list(reader)
             
             for symbol, info in STOCKS_INDICES.items():
                 segment_code = 'I' if info['segment'] == 'IDX_I' else 'E'
@@ -115,11 +113,9 @@ class FnOTradingBot:
                 for row in all_rows:
                     try:
                         is_match = False
-                        # Match Index
                         if segment_code == 'I' and row.get('SEM_SEGMENT') == 'I':
                             if row.get('SEM_TRADING_SYMBOL') in search_variants:
                                 is_match = True
-                        # Match Equity
                         elif segment_code == 'E' and row.get('SEM_SEGMENT') == 'E':
                             if row.get('SEM_TRADING_SYMBOL') in search_variants and row.get('SEM_EXM_EXCH_ID') == 'NSE':
                                 is_match = True
@@ -137,7 +133,7 @@ class FnOTradingBot:
                                 found = True
                                 break
                     except (ValueError, TypeError):
-                        continue # Ignore rows with bad data
+                        continue
                 
                 if not found:
                     logger.warning(f"⚠️ {symbol}: Not found in CSV (tried variants: {search_variants})")
@@ -159,16 +155,16 @@ class FnOTradingBot:
             instrument_type = "INDEX" if segment == "IDX_I" else "EQUITY"
             
             to_date = datetime.now()
-            from_date = to_date - timedelta(days=7) # Fetch a week's data to ensure enough candles
+            from_date = to_date - timedelta(days=7)
             
             payload = {
                 "securityId": str(security_id),
                 "exchangeSegment": exch_seg,
                 "instrument": instrument_type,
-                "expiryDate": "0", # For equity/index, not options
+                "expiryDate": "0",
                 "fromDate": from_date.strftime("%Y-%m-%d"),
                 "toDate": to_date.strftime("%Y-%m-%d"),
-                "interval": "FIVE_MINUTE" # Use documented interval value
+                "interval": "FIVE_MINUTE"
             }
             
             logger.info(f"📊 Fetching chart data for {symbol}...")
@@ -189,7 +185,7 @@ class FnOTradingBot:
                 logger.info(f"✅ {symbol}: Got {len(df)} candles")
                 return df
             else:
-                logger.warning(f"⚠️ {symbol}: No candle data in response or API error. Response: {data}")
+                logger.warning(f"⚠️ {symbol}: No candle data in response. Response: {data}")
                 return None
         except Exception as e:
             logger.error(f"❌ Error getting historical data for {symbol}: {e}")
@@ -202,14 +198,14 @@ class FnOTradingBot:
                 logger.warning(f"{symbol}: Not enough data for chart.")
                 return None
 
-            df.set_index('Date', inplace=True)
+            df_chart = df.copy()
+            df_chart.set_index('Date', inplace=True)
             
-            # Dark theme style for the chart
             mc = mpf.make_marketcolors(up='#26a69a', down='#ef5350', inherit=True)
             s = mpf.make_mpf_style(marketcolors=mc, base_mpf_style='nightclouds')
 
             fig, axes = mpf.plot(
-                df.tail(150), # Plot last 150 candles
+                df_chart.tail(150),
                 type='candle',
                 style=s,
                 volume=True,
@@ -230,6 +226,7 @@ class FnOTradingBot:
             logger.error(f"❌ Error creating chart for {symbol}: {e}")
             return None
 
+    # ============== THIS IS THE CORRECTED FUNCTION ==============
     def get_option_chain(self, security_id, segment, symbol):
         """Fetches the full option chain for a given security."""
         try:
@@ -238,7 +235,8 @@ class FnOTradingBot:
                 "exchangeSegment": "NSE_FNO" # Option chain is in FNO segment
             }
             logger.info(f"⛓️ Fetching option chain for {symbol}...")
-            response = requests.get(DHAN_OPTION_CHAIN_URL, params=payload, headers=self.headers, timeout=15)
+            # THE FIX: Changed from requests.get to requests.post and params to json
+            response = requests.post(DHAN_OPTION_CHAIN_URL, json=payload, headers=self.headers, timeout=15)
             response.raise_for_status()
 
             data = response.json()
@@ -265,23 +263,20 @@ class FnOTradingBot:
             if total_ce_oi == 0 or total_pe_oi == 0:
                 return False, "OI data is zero"
 
-            # 1. PCR Check
             pcr = total_pe_oi / total_ce_oi
             if not (0.7 <= pcr <= 1.5):
                 return False, f"PCR out of range: {pcr:.2f}"
             
-            # 2. Find ATM strike to check IV
             all_strikes = [d['strikePrice'] for d in oc_data.get('optionChainDetails', [])]
             if not all_strikes:
                 return False, "No strikes found in option chain"
             
             atm_strike = min(all_strikes, key=lambda x: abs(x - spot_price))
             
-            # 3. IV Check
             avg_iv = 0
             count = 0
             for details in oc_data.get('optionChainDetails', []):
-                if abs(details['strikePrice'] - atm_strike) <= 200: # Check IV for strikes near ATM
+                if abs(details['strikePrice'] - atm_strike) <= 200:
                     if details.get('ce_impledVolatility', 0) > 0:
                         avg_iv += details['ce_impledVolatility']
                         count += 1
@@ -304,7 +299,6 @@ class FnOTradingBot:
             spot_price = oc_data.get('spotPrice', 0)
             atm_strike = min([d['strikePrice'] for d in oc_data['optionChainDetails']], key=lambda x: abs(x - spot_price))
 
-            # Option Chain Text
             text = f"ANALYSIS FOR: {symbol.upper()}\n"
             text += f"CURRENT SPOT PRICE: {spot_price:,.2f}\n"
             text += f"ATM STRIKE: {atm_strike:,.0f}\n\n"
@@ -313,7 +307,7 @@ class FnOTradingBot:
             text += "-" * 55 + "\n"
 
             for detail in sorted(oc_data['optionChainDetails'], key=lambda x: x['strikePrice']):
-                if abs(detail['strikePrice'] - atm_strike) <= 300: # 3 strikes above and below ATM
+                if abs(detail['strikePrice'] - atm_strike) <= 300 * (1 if 'BANK' in symbol or 'NIFTY' in symbol else 2):
                     strike = detail['strikePrice']
                     ce_ltp = detail.get('ce_lastPrice', 0)
                     ce_oi = detail.get('ce_openInterest', 0) / 100000
@@ -321,7 +315,6 @@ class FnOTradingBot:
                     pe_oi = detail.get('pe_openInterest', 0) / 100000
                     text += f"{strike:<6.0f} | {ce_ltp:<6.2f} | {ce_oi:<15.2f} | {pe_ltp:<6.2f} | {pe_oi:<15.2f}\n"
 
-            # Candle Data Text
             text += "\n--- RECENT PRICE ACTION (Last 15 Candles) ---\n"
             text += "Time (IST)        | Open   | High   | Low    | Close  | Volume\n"
             text += "-" * 70 + "\n"
@@ -330,7 +323,6 @@ class FnOTradingBot:
                 text += f"{time_str:<19} | {row.Open:<6.2f} | {row.High:<6.2f} | {row.Low:<6.2f} | {row.Close:<6.2f} | {row.Volume:,}\n"
 
             return text
-
         except Exception as e:
             logger.error(f"❌ Error formatting data for AI: {e}")
             return "Error formatting data."
@@ -349,11 +341,9 @@ class FnOTradingBot:
                 {"mime_type": "image/png", "data": image_bytes}
             ])
             
-            # Clean and parse JSON
             result_text = response.text.strip().replace('```json', '').replace('```', '')
             result = json.loads(result_text)
             return result
-
         except Exception as e:
             logger.error(f"❌ AI analysis error ({model.model_name}) for {symbol}: {e}")
             return None
@@ -398,7 +388,6 @@ class FnOTradingBot:
             security_id = info['security_id']
             segment = info['segment']
             
-            # 1. Get Option Chain and Pre-filter
             oc_data = self.get_option_chain(security_id, segment, symbol)
             if not oc_data:
                 return
@@ -410,19 +399,16 @@ class FnOTradingBot:
             
             spot_price = oc_data.get('spotPrice', 0)
 
-            # 2. Get Historical Data
             df = self.get_historical_data(security_id, segment, symbol)
-            if df is None or len(df) < 50: # Need enough data for analysis
+            if df is None or len(df) < 50:
                 logger.warning(f"⚠️ {symbol}: Insufficient candle data ({len(df) if df is not None else 0})")
                 return
 
-            # 3. Create Chart and Format Data for AI
             chart_buf = self.create_candlestick_chart(df, symbol, spot_price)
             if not chart_buf: return
 
             formatted_text = self.format_data_for_ai(symbol, oc_data, df)
             
-            # 4. Stage 1: Gemini Flash Scan
             flash_prompt = """
             Analyze the provided chart, option chain, and candle data for a quick trading opportunity.
             Respond in JSON with: {"tradeable": boolean, "signal": "bullish/bearish/neutral", "reason": "brief reason"}
@@ -432,7 +418,6 @@ class FnOTradingBot:
                 logger.info(f"➡️ {symbol} not tradeable per Gemini Flash.")
                 return
 
-            # 5. Stage 2: Gemini Pro for Strategy
             pro_prompt = f"""
             Gemini Flash found a '{flash_result.get('signal')}' signal. Now, create a precise F&O trade plan.
             Analyze all data and respond in JSON with:
@@ -448,11 +433,10 @@ class FnOTradingBot:
             }}
             """
             pro_result = await self.run_ai_analysis(self.gemini_pro, symbol, chart_buf, formatted_text, pro_prompt)
-            if not pro_result or pro_result.get('confidence', 0) < 65: # Confidence threshold
+            if not pro_result or pro_result.get('confidence', 0) < 65:
                 logger.info(f"➡️ {symbol} rejected by Gemini Pro due to low confidence.")
                 return
                 
-            # Final Trade Signal
             trade_signal = {
                 'symbol': symbol,
                 'pro': pro_result,
@@ -494,13 +478,11 @@ async def main():
         logger.critical("❌ Missing one or more critical environment variables. Exiting.")
         return
 
-    # Start the keep-alive server in a separate thread
     server_thread = Thread(target=run_server, daemon=True)
     server_thread.start()
 
     bot_instance = FnOTradingBot()
     
-    # Load security IDs at the very start
     if await bot_instance.load_security_ids():
         await bot_instance.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
@@ -508,15 +490,13 @@ async def main():
             parse_mode='Markdown'
         )
 
-        # Main loop to process stocks periodically
         while bot_instance.running:
             logger.info("============== NEW SCAN CYCLE ==============")
-            # Create a list of tasks to run concurrently
             tasks = [bot_instance.process_stock(stock) for stock in STOCKS_INDICES.keys()]
             await asyncio.gather(*tasks)
             
             logger.info(f"Scan cycle complete. Waiting for 5 minutes...")
-            await asyncio.sleep(300) # Wait for 5 minutes
+            await asyncio.sleep(300)
     else:
         await bot_instance.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
