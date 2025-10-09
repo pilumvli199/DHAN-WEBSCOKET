@@ -228,17 +228,23 @@ class DhanOptionChainBot:
             # DataFrame तयार करतो
             df_data = []
             for candle in candles:
+                timestamp = candle.get('timestamp', candle.get('start_Time', ''))
                 df_data.append({
-                    'Date': pd.to_datetime(candle.get('start_Time', candle.get('timestamp', ''))),
+                    'Date': pd.to_datetime(timestamp) if timestamp else pd.Timestamp.now(),
                     'Open': float(candle.get('open', 0)),
                     'High': float(candle.get('high', 0)),
                     'Low': float(candle.get('low', 0)),
                     'Close': float(candle.get('close', 0)),
-                    'Volume': int(candle.get('volume', 0))
+                    'Volume': int(float(candle.get('volume', 0)))  # Float to int conversion
                 })
             
             df = pd.DataFrame(df_data)
             df.set_index('Date', inplace=True)
+            
+            # Check if enough data
+            if len(df) < 2:
+                logger.warning(f"{symbol}: Not enough candles ({len(df)}) for chart")
+                return None
             
             # Chart style
             mc = mpf.make_marketcolors(
