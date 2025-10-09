@@ -155,20 +155,30 @@ class DhanOptionChainBot:
     def get_historical_data(self, security_id, segment, symbol):
         """Last 199 candles चा historical data घेतो"""
         try:
-            # Exchange code निवडतो
+            from datetime import datetime, timedelta
+            
+            # Dates calculate करतो (last 200 trading days ~= 10 months)
+            to_date = datetime.now()
+            from_date = to_date - timedelta(days=300)  # 300 days back
+            
+            # Exchange segment निवडतो
             if segment == "IDX_I":
                 exch_seg = "IDX_I"
+                instrument = "INDEX"
             else:
                 exch_seg = "NSE_EQ"
+                instrument = "EQUITY"
             
             payload = {
                 "securityId": str(security_id),
                 "exchangeSegment": exch_seg,
-                "instrument": "EQUITY",
+                "instrument": instrument,
                 "expiryCode": 0,
-                "fromDate": "",
-                "toDate": ""
+                "fromDate": from_date.strftime("%Y-%m-%d"),
+                "toDate": to_date.strftime("%Y-%m-%d")
             }
+            
+            logger.info(f"Historical API call for {symbol}: {payload}")
             
             response = requests.post(
                 DHAN_HISTORICAL_URL,
@@ -177,14 +187,20 @@ class DhanOptionChainBot:
                 timeout=15
             )
             
+            logger.info(f"{symbol} Historical response status: {response.status_code}")
+            
             if response.status_code == 200:
                 data = response.json()
-                if data.get('status') == 'success' and data.get('data'):
+                logger.info(f"{symbol} Historical response: {str(data)[:200]}")
+                
+                if data.get('data'):
                     candles = data['data']
                     # Last 199 candles घेतो
-                    return candles[-199:] if len(candles) > 199 else candles
+                    result = candles[-199:] if len(candles) > 199 else candles
+                    logger.info(f"{symbol}: Got {len(result)} candles")
+                    return result
             
-            logger.warning(f"{symbol}: Historical data नाही मिळाला")
+            logger.warning(f"{symbol}: Historical data नाही मिळाला - Response: {response.text[:200]}")
             return None
             
         except Exception as e:
@@ -552,3 +568,10 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         exit(1)
+
+# requirements.txt:
+# python-telegram-bot==20.7
+# requests==2.31.0
+# matplotlib==3.7.1
+# mplfinance==0.12.10b0
+# pandas==2.0.3
